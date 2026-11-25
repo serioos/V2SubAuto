@@ -118,7 +118,7 @@ namespace V2SubAuto.Models
 
         // Mixed Test (Latency + Download Speed)
         public int MixedConcurrencyCount { get; set; } = 8;
-        public string SpeedTestUrl { get; set; } = "https://cachefly.cachefly.net/50mb.test";
+        public string SpeedTestUrl { get; set; } = "https://speed.cloudflare.com/__down?bytes=50000000";
         public int SpeedTestTimeoutSeconds { get; set; } = 8;
         public double MinDownloadSpeedMBps { get; set; } = 1.0;
 
@@ -177,12 +177,12 @@ namespace V2SubAuto.Models
 
         public static readonly string[] PresetSpeedTestUrls =
         {
-            "https://cachefly.cachefly.net/50mb.test",
-            "https://cachefly.cachefly.net/10mb.test",
-            "https://speed.cloudflare.com/__down?bytes=25000000",
             "https://speed.cloudflare.com/__down?bytes=50000000",
+            "https://speed.cloudflare.com/__down?bytes=25000000",
             "https://ash-speed.hetzner.com/100MB.bin",
-            "https://proof.ovh.net/files/10Mb.dat"
+            "https://proof.ovh.net/files/10Mb.dat",
+            "https://cachefly.cachefly.net/50mb.test",
+            "https://cachefly.cachefly.net/10mb.test"
         };
     }
 }

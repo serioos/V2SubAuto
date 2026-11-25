@@ -31,6 +31,9 @@ namespace V2SubAuto.Services
         [GeneratedRegex(@"(?:proxy|mixed|relay)(\d+)")]
         private static partial Regex BadNodeTagRegex();
 
+        [GeneratedRegex(@"(outbound|endpoint|inbound)\[(\d+)\]", RegexOptions.IgnoreCase)]
+        private static partial Regex BadNodeIndexRegex();
+
         public SpeedtestEngine(CoreProcessRunner runner, SettingsService settingsService)
         {
             _runner = runner;
@@ -429,6 +432,7 @@ namespace V2SubAuto.Services
             var singboxNodes = ordered.Where(n => CoreConfigGenerator.ResolveCoreEngine(n, allowInsecure) == CoreEngineType.SingBox).ToList();
 
             using var sharedConcurrencyGate = new SemaphoreSlim(concurrency, concurrency);
+            var mirrorFailures = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             async Task RunEngineSpeedtestAsync(CoreEngineType coreType, string exePath, List<ProxyNode> groupNodes, int maxBatchSize)
             {
@@ -523,6 +527,7 @@ namespace V2SubAuto.Services
                                             client,
                                             settings.SpeedTestUrl,
                                             speedTimeout,
+                                            mirrorFailures,
                                             LogFirstSpeedError,
                                             innerCt).ConfigureAwait(false);
                                     }
@@ -686,16 +691,40 @@ namespace V2SubAuto.Services
                     ? BadNodeTagRegex().Match(err)
                     : Match.Empty;
 
+                ProxyNode? badNode = null;
                 if (tagMatch.Success && int.TryParse(tagMatch.Groups[1].Value, out var badPort))
                 {
-                    var badNode = activeBatch.FirstOrDefault(n => n.LocalTestPort == badPort);
-                    if (badNode != null)
+                    badNode = activeBatch.FirstOrDefault(n => n.LocalTestPort == badPort);
+                }
+                else if (coreType == CoreEngineType.SingBox && !string.IsNullOrEmpty(err))
+                {
+                    var idxMatch = BadNodeIndexRegex().Match(err);
+                    if (idxMatch.Success && int.TryParse(idxMatch.Groups[2].Value, out var badIdx) && badIdx >= 0)
                     {
-                        onNodeDropped(badNode);
-                        activeBatch = activeBatch.Where(n => n.Id != badNode.Id).ToList();
-                        ejectAttempts++;
-                        continue;
+                        var kind = idxMatch.Groups[1].Value;
+                        if (kind.Equals("outbound", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var nonWg = activeBatch.Where(n => n.Protocol != ProxyProtocol.WireGuard).ToList();
+                            if (badIdx < nonWg.Count) badNode = nonWg[badIdx];
+                        }
+                        else if (kind.Equals("endpoint", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var wg = activeBatch.Where(n => n.Protocol == ProxyProtocol.WireGuard).ToList();
+                            if (badIdx < wg.Count) badNode = wg[badIdx];
+                        }
+                        else if (kind.Equals("inbound", StringComparison.OrdinalIgnoreCase) && badIdx < activeBatch.Count)
+                        {
+                            badNode = activeBatch[badIdx];
+                        }
                     }
+                }
+
+                if (badNode != null)
+                {
+                    onNodeDropped(badNode);
+                    activeBatch = activeBatch.Where(n => n.Id != badNode.Id).ToList();
+                    ejectAttempts++;
+                    continue;
                 }
 
                 break;
@@ -783,9 +812,12 @@ namespace V2SubAuto.Services
             HttpClient client,
             string primarySpeedTestUrl,
             TimeSpan timeout,
+            ConcurrentDictionary<string, int> mirrorFailures,
             Action<string>? onFirstError,
             CancellationToken ct)
         {
+            const int MirrorFailureDeprioritizeThreshold = 6;
+
             var urlsToTry = new List<string>(4);
             if (!string.IsNullOrWhiteSpace(primarySpeedTestUrl))
                 urlsToTry.Add(primarySpeedTestUrl.Trim());
@@ -797,27 +829,48 @@ namespace V2SubAuto.Services
                     urlsToTry.Add(mirror);
             }
 
-            foreach (var speedTestUrl in urlsToTry)
+            // Move mirrors that have repeatedly failed (e.g. broken SSL cert or blocked CDN) to the end
+            var orderedUrls = urlsToTry
+                .OrderBy(u => mirrorFailures.TryGetValue(u, out var f) && f >= MirrorFailureDeprioritizeThreshold ? 1 : 0)
+                .ToList();
+
+            string? lastError = null;
+            foreach (var speedTestUrl in orderedUrls)
             {
                 ct.ThrowIfCancellationRequested();
-                var (connected, speedMBps) = await TrySingleMirrorSpeedAsync(client, speedTestUrl, timeout, onFirstError, ct).ConfigureAwait(false);
+                var (connected, speedMBps, error) = await TrySingleMirrorSpeedAsync(client, speedTestUrl, timeout, ct).ConfigureAwait(false);
                 if (connected)
+                {
+                    mirrorFailures[speedTestUrl] = 0;
                     return speedMBps;
+                }
+
+                if (!string.IsNullOrEmpty(error))
+                {
+                    lastError = error;
+                    mirrorFailures.AddOrUpdate(speedTestUrl, 1, (_, prev) => prev + 1);
+                }
+            }
+
+            // Only log once if ALL mirrors failed for a node (avoids noise when mirror #1 fails over cleanly)
+            if (!string.IsNullOrEmpty(lastError))
+            {
+                onFirstError?.Invoke(lastError);
             }
 
             return 0;
         }
 
-        private static async Task<(bool Connected, double SpeedMBps)> TrySingleMirrorSpeedAsync(
+        private static async Task<(bool Connected, double SpeedMBps, string? Error)> TrySingleMirrorSpeedAsync(
             HttpClient client,
             string speedTestUrl,
             TimeSpan timeout,
-            Action<string>? onFirstError,
             CancellationToken ct)
         {
             double maxBytesPerSecond = 0;
             long totalBytes = 0;
             bool connected = false;
+            string? error = null;
             Stopwatch? totalSw = null;
             byte[]? buffer = null;
 
@@ -830,8 +883,7 @@ namespace V2SubAuto.Services
                 using var resp = await client.GetAsync(speedTestUrl, HttpCompletionOption.ResponseHeadersRead, headerLinkedCts.Token).ConfigureAwait(false);
                 if (!resp.IsSuccessStatusCode)
                 {
-                    onFirstError?.Invoke($"Speedtest HTTP {(int)resp.StatusCode} ({resp.ReasonPhrase}) from {speedTestUrl}");
-                    return (false, 0);
+                    return (false, 0, $"Speedtest HTTP {(int)resp.StatusCode} ({resp.ReasonPhrase}) from {speedTestUrl}");
                 }
 
                 connected = true;
@@ -882,13 +934,14 @@ namespace V2SubAuto.Services
             {
                 if (!connected)
                 {
-                    onFirstError?.Invoke($"Speedtest header timeout from {speedTestUrl}");
+                    error = $"Speedtest header timeout from {speedTestUrl}";
                 }
                 // Timeout or 3s stall abort reached after partial download — normal for speedtest
             }
             catch (Exception ex)
             {
-                onFirstError?.Invoke($"Speedtest mirror error ({speedTestUrl}): {ex.Message}");
+                var detail = ex.InnerException != null ? $"{ex.Message} ({ex.InnerException.Message})" : ex.Message;
+                error = $"Speedtest mirror error ({speedTestUrl}): {detail}";
             }
             finally
             {
@@ -904,7 +957,7 @@ namespace V2SubAuto.Services
                 maxBytesPerSecond = totalBytes / totalSw.Elapsed.TotalSeconds;
             }
 
-            return (connected, Math.Round(maxBytesPerSecond / 1_000_000.0, 1));
+            return (connected, Math.Round(maxBytesPerSecond / 1_000_000.0, 1), error);
         }
 
         private static SocketsHttpHandler CreateProxyHandler(int localPort, TimeSpan connectTimeout)

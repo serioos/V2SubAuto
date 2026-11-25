@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using V2SubAuto.Models;
@@ -67,6 +68,7 @@ namespace V2SubAuto.Services
     {
         private readonly string _tempDirectory;
         private readonly IntPtr _jobHandle;
+        private static readonly Regex AnsiEscapeRegex = new(@"\x1B\[[0-9;]*[A-Za-z]", RegexOptions.Compiled);
         private bool _disposed;
 
         public CoreProcessRunner(string baseDirectory)
@@ -124,7 +126,7 @@ namespace V2SubAuto.Services
                 void AppendOutput(string? line)
                 {
                     if (string.IsNullOrWhiteSpace(line)) return;
-                    var trimmed = line.Trim();
+                    var trimmed = AnsiEscapeRegex.Replace(line, string.Empty).Trim();
 
                     // Ignore Xray deprecation warnings so they never drown out real startup errors
                     if (trimmed.Contains("[Warning]", StringComparison.OrdinalIgnoreCase))

@@ -293,15 +293,17 @@ namespace V2SubAuto.Services
                 switch (n.Protocol)
                 {
                     case ProxyProtocol.Hysteria2:
-                    case ProxyProtocol.Trojan:
                         return !string.IsNullOrWhiteSpace(n.Password);
+
+                    case ProxyProtocol.Trojan:
+                        return !string.IsNullOrWhiteSpace(n.Password) && IsValidSingboxTransport(n);
 
                     case ProxyProtocol.Tuic:
                         return Guid.TryParse(n.Username, out _);
 
                     case ProxyProtocol.Vless:
                     case ProxyProtocol.Vmess:
-                        return Guid.TryParse(n.Password, out _);
+                        return Guid.TryParse(n.Password, out _) && IsValidSingboxTransport(n);
 
                     case ProxyProtocol.WireGuard:
                         return IsValidWgKey(n.Password) && IsValidWgKey(n.PublicKey);
@@ -312,11 +314,49 @@ namespace V2SubAuto.Services
             }
         }
 
+        private static bool IsValidUrlPath(string? path)
+        {
+            if (string.IsNullOrEmpty(path)) return true;
+            for (int i = 0; i < path.Length; i++)
+            {
+                char c = path[i];
+                if (c < 0x20 || c == 0x7F) return false;
+                if (c == '%')
+                {
+                    if (i + 2 >= path.Length || !IsHexDigit(path[i + 1]) || !IsHexDigit(path[i + 2]))
+                        return false;
+                    i += 2;
+                }
+            }
+            return true;
+        }
+
+        private static bool IsHexDigit(char c) =>
+            (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+
+        private static bool IsValidSingboxTransport(ProxyNode n)
+        {
+            var net = string.IsNullOrWhiteSpace(n.Network) ? "tcp" : n.Network.ToLowerInvariant();
+            if (net is "ws" or "httpupgrade" or "h2")
+                return IsValidUrlPath(n.Path);
+            return true;
+        }
+
         private static bool IsValidXrayStream(ProxyNode n)
         {
             var net = string.IsNullOrWhiteSpace(n.Network) ? "tcp" : n.Network;
             if (!ValidXrayNetworks.Contains(net))
                 return false;
+
+            if (net.Equals("ws", StringComparison.OrdinalIgnoreCase) ||
+                net.Equals("httpupgrade", StringComparison.OrdinalIgnoreCase) ||
+                net.Equals("h2", StringComparison.OrdinalIgnoreCase) ||
+                net.Equals("xhttp", StringComparison.OrdinalIgnoreCase) ||
+                net.Equals("splithttp", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!IsValidUrlPath(n.Path))
+                    return false;
+            }
 
             if (string.Equals(n.StreamSecurity, "reality", StringComparison.OrdinalIgnoreCase))
             {
@@ -785,6 +825,8 @@ namespace V2SubAuto.Services
             var net = string.IsNullOrWhiteSpace(n.Network) ? "tcp" : n.Network.ToLowerInvariant();
             if (!ValidXrayNetworks.Contains(net))
                 return null;
+            if (net is "ws" or "httpupgrade" or "h2" or "xhttp" or "splithttp" && !IsValidUrlPath(n.Path))
+                return null;
 
             var stream = new JsonObject
             {
@@ -1101,6 +1143,7 @@ namespace V2SubAuto.Services
                 case ProxyProtocol.Vless:
                 {
                     if (!Guid.TryParse(n.Password, out _)) return null;
+                    if (!IsValidSingboxTransport(n)) return null;
                     var obj = new JsonObject
                     {
                         ["type"] = "vless",
@@ -1127,6 +1170,7 @@ namespace V2SubAuto.Services
                 case ProxyProtocol.Trojan:
                 {
                     if (string.IsNullOrWhiteSpace(n.Password)) return null;
+                    if (!IsValidSingboxTransport(n)) return null;
                     var obj = new JsonObject
                     {
                         ["type"] = "trojan",
@@ -1146,6 +1190,7 @@ namespace V2SubAuto.Services
                 case ProxyProtocol.Vmess:
                 {
                     if (!Guid.TryParse(n.Password, out _)) return null;
+                    if (!IsValidSingboxTransport(n)) return null;
                     var sec = ValidVmessSecurity.Contains(n.VmessSecurity) ? n.VmessSecurity : "auto";
                     var obj = new JsonObject
                     {
