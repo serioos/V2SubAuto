@@ -398,8 +398,7 @@ namespace V2SubAuto.Views
             catch (Exception ex)
             {
                 MessageBox.Show(
-                    $"Could not read the selected file:
-{ex.Message}",
+                    $"Could not read the selected file:\n{ex.Message}",
                     "V2SubAuto",
                     MessageBoxButton.OK,
                     MessageBoxImage.Error);
