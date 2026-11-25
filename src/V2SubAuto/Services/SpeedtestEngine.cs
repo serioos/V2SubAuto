@@ -27,7 +27,7 @@ namespace V2SubAuto.Services
         private readonly CoreProcessRunner _runner;
         private readonly SettingsService _settingsService;
 
-        [GeneratedRegex(@"(?:proxy|mixed)(\d+)")]
+        [GeneratedRegex(@"(?:proxy|mixed|relay)(\d+)")]
         private static partial Regex BadNodeTagRegex();
 
         public SpeedtestEngine(CoreProcessRunner runner, SettingsService settingsService)
@@ -201,8 +201,9 @@ namespace V2SubAuto.Services
                 if (d % 20 == 0 || d == total) onProgress(d, total);
             }
 
-            var xrayNodes = nodes.Where(n => n.CoreType == CoreEngineType.Xray).ToList();
-            var singboxNodes = nodes.Where(n => n.CoreType == CoreEngineType.SingBox).ToList();
+            bool allowInsecure = settings.AllowInsecureAndUnencrypted;
+            var xrayNodes = nodes.Where(n => CoreConfigGenerator.ResolveCoreEngine(n, allowInsecure) == CoreEngineType.Xray).ToList();
+            var singboxNodes = nodes.Where(n => CoreConfigGenerator.ResolveCoreEngine(n, allowInsecure) == CoreEngineType.SingBox).ToList();
 
             var tasks = new List<Task>(2);
 
@@ -278,6 +279,7 @@ namespace V2SubAuto.Services
                     coreType,
                     exePath,
                     batch,
+                    settings.AllowInsecureAndUnencrypted,
                     dropped =>
                     {
                         dropped.RealDelayMs = -1;
@@ -384,9 +386,10 @@ namespace V2SubAuto.Services
             var pingTimeout = TimeSpan.FromSeconds(Math.Max(2, settings.RealPingTimeoutSeconds));
             var speedTimeout = TimeSpan.FromSeconds(Math.Max(2, settings.SpeedTestTimeoutSeconds));
             int concurrency = Math.Max(1, settings.MixedConcurrencyCount);
+            bool allowInsecure = settings.AllowInsecureAndUnencrypted;
 
-            var xrayNodes = ordered.Where(n => n.CoreType == CoreEngineType.Xray).ToList();
-            var singboxNodes = ordered.Where(n => n.CoreType == CoreEngineType.SingBox).ToList();
+            var xrayNodes = ordered.Where(n => CoreConfigGenerator.ResolveCoreEngine(n, allowInsecure) == CoreEngineType.Xray).ToList();
+            var singboxNodes = ordered.Where(n => CoreConfigGenerator.ResolveCoreEngine(n, allowInsecure) == CoreEngineType.SingBox).ToList();
 
             async Task RunEngineSpeedtestAsync(CoreEngineType coreType, string exePath, List<ProxyNode> groupNodes, int maxBatchSize)
             {
@@ -414,6 +417,7 @@ namespace V2SubAuto.Services
                         coreType,
                         exePath,
                         batch,
+                        allowInsecure,
                         dropped =>
                         {
                             dropped.RealDelayMs = -1;
@@ -535,15 +539,17 @@ namespace V2SubAuto.Services
             CoreEngineType coreType,
             string exePath,
             List<ProxyNode> batch,
+            bool allowInsecureAndUnencrypted,
             Action<ProxyNode> onNodeDropped,
             CancellationToken ct)
         {
             var json = coreType == CoreEngineType.Xray
-                ? CoreConfigGenerator.GenerateXraySpeedtestConfig(batch, out var testable)
-                : CoreConfigGenerator.GenerateSingboxSpeedtestConfig(batch, out testable);
+                ? CoreConfigGenerator.GenerateXraySpeedtestConfig(batch, allowInsecureAndUnencrypted, out var testable, out var initialLeasedPorts)
+                : CoreConfigGenerator.GenerateSingboxSpeedtestConfig(batch, allowInsecureAndUnencrypted, out testable, out initialLeasedPorts);
 
             if (string.IsNullOrEmpty(json) || testable.Count == 0)
             {
+                PortAllocator.ReleasePorts(initialLeasedPorts);
                 foreach (var n in batch) onNodeDropped(n);
                 return (null, new List<ProxyNode>(), null);
             }
@@ -557,11 +563,12 @@ namespace V2SubAuto.Services
                 }
             }
 
-            // Surgical bad-node ejection: if Xray/sing-box names the exact offending "proxy<port>" or "mixed<port>",
+            // Surgical bad-node ejection: if Xray/sing-box names the exact offending "proxy<port>", "mixed<port>", or "relay<port>",
             // drop that single node and immediately retry the remaining batch instead of halving!
             CoreProcessInstance? proc = null;
             string? err = null;
             var activeBatch = testable;
+            var currentLeasedPorts = initialLeasedPorts;
             int ejectAttempts = 0;
 
             while (activeBatch.Count > 0 && ejectAttempts < 25)
@@ -574,14 +581,16 @@ namespace V2SubAuto.Services
                 else
                 {
                     currentJson = coreType == CoreEngineType.Xray
-                        ? CoreConfigGenerator.GenerateXraySpeedtestConfig(activeBatch, out activeBatch)
-                        : CoreConfigGenerator.GenerateSingboxSpeedtestConfig(activeBatch, out activeBatch);
+                        ? CoreConfigGenerator.GenerateXraySpeedtestConfig(activeBatch, allowInsecureAndUnencrypted, out activeBatch, out currentLeasedPorts)
+                        : CoreConfigGenerator.GenerateSingboxSpeedtestConfig(activeBatch, allowInsecureAndUnencrypted, out activeBatch, out currentLeasedPorts);
                 }
 
                 if (string.IsNullOrEmpty(currentJson) || activeBatch.Count == 0)
+                {
+                    PortAllocator.ReleasePorts(currentLeasedPorts);
                     break;
+                }
 
-                var leasedPorts = activeBatch.Select(n => n.LocalTestPort).ToList();
                 var probePort = activeBatch[^1].LocalTestPort;
                 (proc, err) = await _runner.StartCoreAsync(
                     coreType,
@@ -589,7 +598,7 @@ namespace V2SubAuto.Services
                     currentJson,
                     probePort,
                     ct,
-                    leasedPorts,
+                    currentLeasedPorts,
                     activeBatch.Count).ConfigureAwait(false);
 
                 if (proc != null)

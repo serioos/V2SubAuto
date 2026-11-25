@@ -74,7 +74,7 @@ namespace V2SubAuto
                 _localServer.UpdatePayload(cachedRaw, cachedB64, lineCount, cachedTimestamp);
             }
 
-            bool serverStarted = _localServer.Start(_settings.LocalServerPort);
+            bool serverStarted = _localServer.Start(_settings.LocalServerPort, _settings.AllowLanAccess);
 
             _orchestrator = new PipelineOrchestrator(
                 _settings,
@@ -94,7 +94,7 @@ namespace V2SubAuto
 
             if (!serverStarted)
             {
-                var msg = $"Local subscription server could not bind to port {_settings.LocalServerPort}. Change the port in Settings and save.";
+                var msg = $"Subscription server could not bind to port {_settings.LocalServerPort}. Change the port in Settings and save.";
                 _mainWindow.LogWarning(msg);
                 _trayIcon?.ShowBalloonTip(4000, "V2SubAuto — Port Bind Error", msg, System.Windows.Forms.ToolTipIcon.Warning);
             }
@@ -153,6 +153,24 @@ namespace V2SubAuto
                 catch { }
             });
 
+            var copyLanUrlItem = new System.Windows.Forms.ToolStripMenuItem("Copy LAN Subscription URL");
+            copyLanUrlItem.Click += (_, _) => Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    if (!string.IsNullOrEmpty(_localServer.LanSubscriptionUrl))
+                    {
+                        Clipboard.SetText(_localServer.LanSubscriptionUrl);
+                        _trayIcon?.ShowBalloonTip(2000, "V2SubAuto", $"Copied {_localServer.LanSubscriptionUrl}", System.Windows.Forms.ToolTipIcon.Info);
+                    }
+                    else
+                    {
+                        _trayIcon?.ShowBalloonTip(2500, "V2SubAuto", "LAN access is disabled or no LAN IP was detected.", System.Windows.Forms.ToolTipIcon.Warning);
+                    }
+                }
+                catch { }
+            });
+
             var exitItem = new System.Windows.Forms.ToolStripMenuItem("Exit");
             exitItem.Click += (_, _) => Dispatcher.Invoke(RequestExit);
 
@@ -161,6 +179,7 @@ namespace V2SubAuto
             menu.Items.Add(runItem);
             menu.Items.Add(stopItem);
             menu.Items.Add(copyUrlItem);
+            menu.Items.Add(copyLanUrlItem);
             menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
             menu.Items.Add(exitItem);
 

@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Text.Json.Nodes;
 using V2SubAuto.Models;
 
@@ -81,6 +83,11 @@ namespace V2SubAuto.Services
             "tcp", "ws", "grpc", "h2", "httpupgrade", "xhttp", "splithttp", "kcp"
         };
 
+        private static readonly HashSet<string> ValidSingboxNetworks = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "tcp", "ws", "grpc", "h2", "httpupgrade"
+        };
+
         private static readonly HashSet<string> ValidXraySsMethods = new(StringComparer.OrdinalIgnoreCase)
         {
             "aes-128-gcm", "aes-256-gcm",
@@ -111,23 +118,157 @@ namespace V2SubAuto.Services
         };
 
         /// <summary>
-        /// Cheap structural validation used before Tcping so malformed nodes never waste sockets.
+        /// Returns true if the server address is a loopback, private RFC1918, link-local, or local domain.
+        /// Xray-core v26.7.11+ only permits unencrypted VLESS/Trojan to private addresses.
         /// </summary>
-        public static bool IsStructurallyValid(ProxyNode n)
+        public static bool IsPrivateAddress(string? address)
+        {
+            if (string.IsNullOrWhiteSpace(address)) return false;
+            var host = address.Trim();
+
+            if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+                host.EndsWith(".local", StringComparison.OrdinalIgnoreCase) ||
+                host.EndsWith(".lan", StringComparison.OrdinalIgnoreCase) ||
+                host.EndsWith(".internal", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (IPAddress.TryParse(host, out var ip))
+            {
+                if (IPAddress.IsLoopback(ip)) return true;
+
+                if (ip.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    var b = ip.GetAddressBytes();
+                    return b[0] == 10
+                        || b[0] == 127
+                        || (b[0] == 172 && b[1] >= 16 && b[1] <= 31)
+                        || (b[0] == 192 && b[1] == 168)
+                        || (b[0] == 169 && b[1] == 254);
+                }
+
+                if (ip.AddressFamily == AddressFamily.InterNetworkV6)
+                {
+                    if (ip.IsIPv6LinkLocal || ip.IsIPv6SiteLocal) return true;
+                    var b = ip.GetAddressBytes();
+                    return (b[0] & 0xFE) == 0xFC; // fc00::/7 Unique Local
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Returns true if this is a public VLESS or Trojan node without TLS/Reality (or VLESS encryption),
+        /// which Xray-core v26.7.11+ rejects on startup.
+        /// </summary>
+        public static bool IsUnencryptedVlessOrTrojan(ProxyNode n)
+        {
+            bool hasTransportSecurity = string.Equals(n.StreamSecurity, "tls", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(n.StreamSecurity, "reality", StringComparison.OrdinalIgnoreCase);
+
+            if (hasTransportSecurity || IsPrivateAddress(n.Address))
+                return false;
+
+            if (n.Protocol == ProxyProtocol.Vless)
+            {
+                bool hasVlessEnc = !string.IsNullOrWhiteSpace(n.VlessEncryption)
+                    && !string.Equals(n.VlessEncryption.Trim(), "none", StringComparison.OrdinalIgnoreCase);
+                return !hasVlessEnc;
+            }
+
+            return n.Protocol == ProxyProtocol.Trojan;
+        }
+
+        /// <summary>
+        /// Returns true if the node uses TLS with allowInsecure enabled (which Xray-core v26.2.6+ removed).
+        /// </summary>
+        public static bool IsInsecureTlsNode(ProxyNode n)
+        {
+            return string.Equals(n.StreamSecurity, "tls", StringComparison.OrdinalIgnoreCase) && n.AllowInsecure;
+        }
+
+        /// <summary>
+        /// Returns true if sing-box natively supports this node's protocol and transport.
+        /// </summary>
+        public static bool CanRunInSingbox(ProxyNode n)
+        {
+            if (n.CoreType == CoreEngineType.SingBox)
+                return true;
+
+            if (n.Protocol is not (ProxyProtocol.Vless or ProxyProtocol.Vmess or ProxyProtocol.Trojan))
+                return false;
+
+            if (string.Equals(n.StreamSecurity, "reality", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var net = string.IsNullOrWhiteSpace(n.Network) ? "tcp" : n.Network.ToLowerInvariant();
+            if (!ValidSingboxNetworks.Contains(net))
+                return false;
+
+            if (net == "tcp" && string.Equals(n.RawHeaderType, "http", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (n.Protocol == ProxyProtocol.Vless)
+            {
+                bool hasVlessEnc = !string.IsNullOrWhiteSpace(n.VlessEncryption)
+                    && !string.Equals(n.VlessEncryption.Trim(), "none", StringComparison.OrdinalIgnoreCase);
+                if (hasVlessEnc) return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Selects which core engine should test a node. When AllowInsecureAndUnencrypted is enabled,
+        /// unencrypted VLESS/Trojan and insecure TLS nodes on sing-box-compatible transports are routed
+        /// to sing-box (which natively allows plaintext VLESS/Trojan and tls.insecure=true).
+        /// </summary>
+        public static CoreEngineType ResolveCoreEngine(ProxyNode n, bool allowInsecureAndUnencrypted)
+        {
+            if (n.CoreType == CoreEngineType.SingBox)
+                return CoreEngineType.SingBox;
+
+            if (allowInsecureAndUnencrypted &&
+                (IsUnencryptedVlessOrTrojan(n) || IsInsecureTlsNode(n)) &&
+                CanRunInSingbox(n))
+            {
+                return CoreEngineType.SingBox;
+            }
+
+            return CoreEngineType.Xray;
+        }
+
+        /// <summary>
+        /// Cheap structural validation used before Tcping so malformed (or disallowed unencrypted)
+        /// nodes never waste sockets or crash core batches.
+        /// </summary>
+        public static bool IsStructurallyValid(ProxyNode n, bool allowInsecureAndUnencrypted = false)
         {
             if (string.IsNullOrWhiteSpace(n.Address) || n.Port <= 0 || n.Port > 65535)
                 return false;
 
-            return n.CoreType == CoreEngineType.Xray
+            if (!allowInsecureAndUnencrypted && IsUnencryptedVlessOrTrojan(n))
+                return false;
+
+            var engine = ResolveCoreEngine(n, allowInsecureAndUnencrypted);
+            return engine == CoreEngineType.Xray
                 ? BuildXrayOutbound(n, "check") != null
                 : (n.Protocol == ProxyProtocol.WireGuard
                     ? BuildSingboxWireGuardEndpoint(n, "check") != null
-                    : BuildSingboxOutbound(n, "check") != null);
+                    : BuildSingboxOutbound(n, "check", allowInsecureAndUnencrypted) != null);
         }
 
-        public static string? GenerateXraySpeedtestConfig(IList<ProxyNode> nodes, out List<ProxyNode> testableNodes)
+        public static string? GenerateXraySpeedtestConfig(
+            IList<ProxyNode> nodes,
+            bool allowInsecureAndUnencrypted,
+            out List<ProxyNode> testableNodes,
+            out List<int> leasedPorts)
         {
             testableNodes = new List<ProxyNode>();
+            leasedPorts = new List<int>();
+
             var ports = PortAllocator.AllocatePorts(nodes.Count);
             if (ports.Count < nodes.Count)
                 return null;
@@ -144,15 +285,41 @@ namespace V2SubAuto.Services
                 var outboundTag = $"proxy{port}";
                 var inboundTag = $"mixed{port}";
 
-                var outbound = BuildXrayOutbound(node, outboundTag);
-                if (outbound == null)
+                bool needsLoopbackRelay = IsUnencryptedVlessOrTrojan(node);
+                if (needsLoopbackRelay && !allowInsecureAndUnencrypted)
                 {
                     unusedPorts.Add(port);
                     continue;
                 }
 
+                string? overrideAddr = null;
+                int? overridePort = null;
+                int relayPort = 0;
+
+                if (needsLoopbackRelay)
+                {
+                    var relayAlloc = PortAllocator.AllocatePorts(1);
+                    if (relayAlloc.Count == 0)
+                    {
+                        unusedPorts.Add(port);
+                        continue;
+                    }
+                    relayPort = relayAlloc[0];
+                    overrideAddr = "127.0.0.1";
+                    overridePort = relayPort;
+                }
+
+                var outbound = BuildXrayOutbound(node, outboundTag, overrideAddr, overridePort);
+                if (outbound == null)
+                {
+                    unusedPorts.Add(port);
+                    if (relayPort > 0) unusedPorts.Add(relayPort);
+                    continue;
+                }
+
                 node.LocalTestPort = port;
                 testableNodes.Add(node);
+                leasedPorts.Add(port);
 
                 inbounds.Add(new JsonObject
                 {
@@ -175,6 +342,31 @@ namespace V2SubAuto.Services
                     ["inboundTag"] = new JsonArray { inboundTag },
                     ["outboundTag"] = outboundTag
                 });
+
+                if (relayPort > 0)
+                {
+                    leasedPorts.Add(relayPort);
+                    var relayTag = $"relay{port}";
+                    inbounds.Add(new JsonObject
+                    {
+                        ["tag"] = relayTag,
+                        ["listen"] = "127.0.0.1",
+                        ["port"] = relayPort,
+                        ["protocol"] = "dokodemo-door",
+                        ["settings"] = new JsonObject
+                        {
+                            ["address"] = node.Address,
+                            ["port"] = node.Port,
+                            ["network"] = "tcp,udp"
+                        }
+                    });
+                    rules.Add(new JsonObject
+                    {
+                        ["type"] = "field",
+                        ["inboundTag"] = new JsonArray { relayTag },
+                        ["outboundTag"] = "direct"
+                    });
+                }
             }
 
             if (unusedPorts.Count > 0)
@@ -183,7 +375,11 @@ namespace V2SubAuto.Services
             }
 
             if (testableNodes.Count == 0)
+            {
+                PortAllocator.ReleasePorts(leasedPorts);
+                leasedPorts.Clear();
                 return null;
+            }
 
             outbounds.Add(new JsonObject
             {
@@ -206,9 +402,15 @@ namespace V2SubAuto.Services
             return root.ToJsonString();
         }
 
-        public static string? GenerateSingboxSpeedtestConfig(IList<ProxyNode> nodes, out List<ProxyNode> testableNodes)
+        public static string? GenerateSingboxSpeedtestConfig(
+            IList<ProxyNode> nodes,
+            bool allowInsecureAndUnencrypted,
+            out List<ProxyNode> testableNodes,
+            out List<int> leasedPorts)
         {
             testableNodes = new List<ProxyNode>();
+            leasedPorts = new List<int>();
+
             var ports = PortAllocator.AllocatePorts(nodes.Count);
             if (ports.Count < nodes.Count)
                 return null;
@@ -238,7 +440,7 @@ namespace V2SubAuto.Services
                 }
                 else
                 {
-                    var outbound = BuildSingboxOutbound(node, targetTag);
+                    var outbound = BuildSingboxOutbound(node, targetTag, allowInsecureAndUnencrypted);
                     if (outbound == null)
                     {
                         unusedPorts.Add(port);
@@ -249,6 +451,7 @@ namespace V2SubAuto.Services
 
                 node.LocalTestPort = port;
                 testableNodes.Add(node);
+                leasedPorts.Add(port);
 
                 inbounds.Add(new JsonObject
                 {
@@ -271,7 +474,11 @@ namespace V2SubAuto.Services
             }
 
             if (testableNodes.Count == 0)
+            {
+                PortAllocator.ReleasePorts(leasedPorts);
+                leasedPorts.Clear();
                 return null;
+            }
 
             outbounds.Add(new JsonObject
             {
@@ -299,10 +506,17 @@ namespace V2SubAuto.Services
             return root.ToJsonString();
         }
 
-        private static JsonObject? BuildXrayOutbound(ProxyNode n, string tag)
+        private static JsonObject? BuildXrayOutbound(
+            ProxyNode n,
+            string tag,
+            string? overrideAddress = null,
+            int? overridePort = null)
         {
             if (string.IsNullOrWhiteSpace(n.Address) || n.Port <= 0 || n.Port > 65535)
                 return null;
+
+            var targetAddr = overrideAddress ?? n.Address;
+            var targetPort = overridePort ?? n.Port;
 
             switch (n.Protocol)
             {
@@ -324,8 +538,8 @@ namespace V2SubAuto.Services
                             {
                                 new JsonObject
                                 {
-                                    ["address"] = n.Address,
-                                    ["port"] = n.Port,
+                                    ["address"] = targetAddr,
+                                    ["port"] = targetPort,
                                     ["users"] = new JsonArray
                                     {
                                         new JsonObject
@@ -372,8 +586,8 @@ namespace V2SubAuto.Services
                             {
                                 new JsonObject
                                 {
-                                    ["address"] = n.Address,
-                                    ["port"] = n.Port,
+                                    ["address"] = targetAddr,
+                                    ["port"] = targetPort,
                                     ["users"] = new JsonArray
                                     {
                                         new JsonObject
@@ -407,8 +621,8 @@ namespace V2SubAuto.Services
                             {
                                 new JsonObject
                                 {
-                                    ["address"] = n.Address,
-                                    ["port"] = n.Port,
+                                    ["address"] = targetAddr,
+                                    ["port"] = targetPort,
                                     ["password"] = n.Password
                                 }
                             }
@@ -437,8 +651,8 @@ namespace V2SubAuto.Services
                             {
                                 new JsonObject
                                 {
-                                    ["address"] = n.Address,
-                                    ["port"] = n.Port,
+                                    ["address"] = targetAddr,
+                                    ["port"] = targetPort,
                                     ["method"] = n.SsMethod.ToLowerInvariant(),
                                     ["password"] = n.Password
                                 }
@@ -523,10 +737,8 @@ namespace V2SubAuto.Services
                 {
                     ["serverName"] = !string.IsNullOrEmpty(n.Sni) ? n.Sni : (!string.IsNullOrEmpty(n.Host) ? n.Host : n.Address)
                 };
-                if (n.AllowInsecure)
-                {
-                    tls["allowInsecure"] = true;
-                }
+                // Note: Xray-core v26.2.6+ removed tlsSettings.allowInsecure and fails to start if present.
+                // Insecure TLS nodes are routed to sing-box when AllowInsecureAndUnencrypted is enabled.
                 if (!string.IsNullOrEmpty(n.Fingerprint) && ValidFingerprints.Contains(n.Fingerprint))
                 {
                     tls["fingerprint"] = n.Fingerprint.ToLowerInvariant();
@@ -716,7 +928,7 @@ namespace V2SubAuto.Services
             return true;
         }
 
-        private static JsonObject? BuildSingboxOutbound(ProxyNode n, string tag)
+        private static JsonObject? BuildSingboxOutbound(ProxyNode n, string tag, bool allowInsecureAndUnencrypted)
         {
             if (string.IsNullOrWhiteSpace(n.Address) || n.Port <= 0 || n.Port > 65535)
                 return null;
@@ -733,7 +945,7 @@ namespace V2SubAuto.Services
                         ["server"] = n.Address,
                         ["server_port"] = n.Port,
                         ["password"] = n.Password,
-                        ["tls"] = BuildSingboxTls(n)
+                        ["tls"] = BuildSingboxTls(n, allowInsecureAndUnencrypted, forceEnabled: true)
                     };
                     if (!string.IsNullOrEmpty(n.SalamanderPass))
                     {
@@ -757,8 +969,132 @@ namespace V2SubAuto.Services
                         ["uuid"] = n.Username,
                         ["password"] = n.Password,
                         ["congestion_control"] = string.IsNullOrEmpty(n.CongestionControl) ? "bbr" : n.CongestionControl,
-                        ["tls"] = BuildSingboxTls(n)
+                        ["tls"] = BuildSingboxTls(n, allowInsecureAndUnencrypted, forceEnabled: true)
                     };
+                }
+                case ProxyProtocol.Vless:
+                {
+                    if (!Guid.TryParse(n.Password, out _)) return null;
+                    var obj = new JsonObject
+                    {
+                        ["type"] = "vless",
+                        ["tag"] = tag,
+                        ["server"] = n.Address,
+                        ["server_port"] = n.Port,
+                        ["uuid"] = n.Password
+                    };
+                    bool hasTls = string.Equals(n.StreamSecurity, "tls", StringComparison.OrdinalIgnoreCase);
+                    if (hasTls)
+                    {
+                        obj["tls"] = BuildSingboxTls(n, allowInsecureAndUnencrypted, forceEnabled: false);
+                        if (!string.IsNullOrEmpty(n.Flow) &&
+                            ValidVlessFlows.Contains(n.Flow) &&
+                            string.Equals(n.Network, "tcp", StringComparison.OrdinalIgnoreCase))
+                        {
+                            obj["flow"] = n.Flow;
+                        }
+                    }
+                    var transport = BuildSingboxTransport(n);
+                    if (transport != null) obj["transport"] = transport;
+                    return obj;
+                }
+                case ProxyProtocol.Trojan:
+                {
+                    if (string.IsNullOrWhiteSpace(n.Password)) return null;
+                    var obj = new JsonObject
+                    {
+                        ["type"] = "trojan",
+                        ["tag"] = tag,
+                        ["server"] = n.Address,
+                        ["server_port"] = n.Port,
+                        ["password"] = n.Password
+                    };
+                    if (string.Equals(n.StreamSecurity, "tls", StringComparison.OrdinalIgnoreCase))
+                    {
+                        obj["tls"] = BuildSingboxTls(n, allowInsecureAndUnencrypted, forceEnabled: false);
+                    }
+                    var transport = BuildSingboxTransport(n);
+                    if (transport != null) obj["transport"] = transport;
+                    return obj;
+                }
+                case ProxyProtocol.Vmess:
+                {
+                    if (!Guid.TryParse(n.Password, out _)) return null;
+                    var sec = ValidVmessSecurity.Contains(n.VmessSecurity) ? n.VmessSecurity : "auto";
+                    var obj = new JsonObject
+                    {
+                        ["type"] = "vmess",
+                        ["tag"] = tag,
+                        ["server"] = n.Address,
+                        ["server_port"] = n.Port,
+                        ["uuid"] = n.Password,
+                        ["security"] = sec,
+                        ["alter_id"] = Math.Clamp(n.VmessAlterId, 0, 65535)
+                    };
+                    if (string.Equals(n.StreamSecurity, "tls", StringComparison.OrdinalIgnoreCase))
+                    {
+                        obj["tls"] = BuildSingboxTls(n, allowInsecureAndUnencrypted, forceEnabled: false);
+                    }
+                    var transport = BuildSingboxTransport(n);
+                    if (transport != null) obj["transport"] = transport;
+                    return obj;
+                }
+                default:
+                    return null;
+            }
+        }
+
+        private static JsonObject? BuildSingboxTransport(ProxyNode n)
+        {
+            var net = string.IsNullOrWhiteSpace(n.Network) ? "tcp" : n.Network.ToLowerInvariant();
+            switch (net)
+            {
+                case "ws":
+                {
+                    var ws = new JsonObject
+                    {
+                        ["type"] = "ws",
+                        ["path"] = string.IsNullOrEmpty(n.Path) ? "/" : n.Path
+                    };
+                    if (!string.IsNullOrEmpty(n.Host))
+                    {
+                        ws["headers"] = new JsonObject { ["Host"] = n.Host };
+                    }
+                    return ws;
+                }
+                case "grpc":
+                {
+                    return new JsonObject
+                    {
+                        ["type"] = "grpc",
+                        ["service_name"] = n.GrpcServiceName ?? string.Empty
+                    };
+                }
+                case "httpupgrade":
+                {
+                    var hu = new JsonObject
+                    {
+                        ["type"] = "httpupgrade",
+                        ["path"] = string.IsNullOrEmpty(n.Path) ? "/" : n.Path
+                    };
+                    if (!string.IsNullOrEmpty(n.Host)) hu["host"] = n.Host;
+                    return hu;
+                }
+                case "h2":
+                {
+                    var h2 = new JsonObject
+                    {
+                        ["type"] = "http",
+                        ["path"] = string.IsNullOrEmpty(n.Path) ? "/" : n.Path
+                    };
+                    if (!string.IsNullOrEmpty(n.Host))
+                    {
+                        var hosts = new JsonArray();
+                        foreach (var h in n.Host.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                            hosts.Add(h);
+                        if (hosts.Count > 0) h2["host"] = hosts;
+                    }
+                    return h2;
                 }
                 default:
                     return null;
@@ -838,13 +1174,18 @@ namespace V2SubAuto.Services
             return null;
         }
 
-        private static JsonObject BuildSingboxTls(ProxyNode n)
+        private static JsonObject BuildSingboxTls(ProxyNode n, bool allowInsecureAndUnencrypted, bool forceEnabled)
         {
+            bool insecure = allowInsecureAndUnencrypted || (forceEnabled && n.AllowInsecure);
+            var serverName = !string.IsNullOrEmpty(n.Sni)
+                ? n.Sni
+                : (!string.IsNullOrEmpty(n.Host) ? n.Host : n.Address);
+
             var tls = new JsonObject
             {
                 ["enabled"] = true,
-                ["server_name"] = !string.IsNullOrEmpty(n.Sni) ? n.Sni : n.Address,
-                ["insecure"] = n.AllowInsecure
+                ["server_name"] = serverName,
+                ["insecure"] = insecure
             };
             if (!string.IsNullOrEmpty(n.Alpn))
             {
@@ -852,6 +1193,14 @@ namespace V2SubAuto.Services
                 foreach (var a in n.Alpn.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                     arr.Add(a);
                 if (arr.Count > 0) tls["alpn"] = arr;
+            }
+            if (!forceEnabled && !string.IsNullOrEmpty(n.Fingerprint) && ValidFingerprints.Contains(n.Fingerprint))
+            {
+                tls["utls"] = new JsonObject
+                {
+                    ["enabled"] = true,
+                    ["fingerprint"] = n.Fingerprint.ToLowerInvariant()
+                };
             }
             return tls;
         }

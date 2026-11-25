@@ -186,12 +186,18 @@ namespace V2SubAuto.Services
                     Log("Skipped Deduplication step (disabled in Settings).");
                 }
 
-                // Early structural pre-filter so malformed configs never waste Tcping sockets
+                // Early structural pre-filter so malformed (or disallowed unencrypted) configs never waste Tcping sockets
                 int preFilterCount = current.Count;
-                current = current.Where(CoreConfigGenerator.IsStructurallyValid).ToList();
+                int unencryptedSkipped = !s.AllowInsecureAndUnencrypted
+                    ? current.Count(CoreConfigGenerator.IsUnencryptedVlessOrTrojan)
+                    : 0;
+                current = current.Where(n => CoreConfigGenerator.IsStructurallyValid(n, s.AllowInsecureAndUnencrypted)).ToList();
                 if (current.Count < preFilterCount)
                 {
-                    Log($"Pre-filter removed {preFilterCount - current.Count} structurally invalid config(s).");
+                    var extra = unencryptedSkipped > 0
+                        ? $" (including {unencryptedSkipped} unencrypted VLESS/Trojan — enable 'Allow insecure & unencrypted connections' in Settings to include them)"
+                        : string.Empty;
+                    Log($"Pre-filter removed {preFilterCount - current.Count} config(s){extra}.");
                 }
 
                 if (current.Count == 0)
@@ -315,12 +321,15 @@ namespace V2SubAuto.Services
                     return;
                 }
 
-                // 7. Publish to Local Subscription Server
-                UpdateStage("7/7 Serving Subscription", $"Publishing {surviving.Count} configs to {_server.SubscriptionUrl}...", 99);
+                // 7. Publish to Local & LAN Subscription Server
+                var lanSuffix = !string.IsNullOrEmpty(_server.LanSubscriptionUrl)
+                    ? $" (LAN: {_server.LanSubscriptionUrl})"
+                    : string.Empty;
+                UpdateStage("7/7 Serving Subscription", $"Publishing {surviving.Count} configs to {_server.SubscriptionUrl}{lanSuffix}...", 99);
                 PublishResults(surviving, s);
 
-                Log($"Pipeline finished! Serving {surviving.Count} configs at {_server.SubscriptionUrl}");
-                CompleteRun("Completed", $"Serving {surviving.Count} fast configs at {_server.SubscriptionUrl}");
+                Log($"Pipeline finished! Serving {surviving.Count} configs at {_server.SubscriptionUrl}{lanSuffix}");
+                CompleteRun("Completed", $"Serving {surviving.Count} fast configs at {_server.SubscriptionUrl}{lanSuffix}");
             }
             catch (OperationCanceledException)
             {

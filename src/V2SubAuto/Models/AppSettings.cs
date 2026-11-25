@@ -47,6 +47,9 @@ namespace V2SubAuto.Models
         // Deduplication (matches V2RayN KeepOlderDedupl)
         public bool KeepOlderDedupl { get; set; } = false;
 
+        // Security / Compatibility
+        public bool AllowInsecureAndUnencrypted { get; set; } = false;
+
         // Tcping & Real Delay (tuned for fast batch throughput)
         public int TcpingBatchSize { get; set; } = 1000;
         public int TcpingTimeoutSeconds { get; set; } = 4;
@@ -63,6 +66,7 @@ namespace V2SubAuto.Models
 
         // Local Subscription Server
         public int LocalServerPort { get; set; } = 18080;
+        public bool AllowLanAccess { get; set; } = true;
         public bool AppendMetricsToRemarks { get; set; } = true;
         public SortOrderMode OutputSortMode { get; set; } = SortOrderMode.SpeedDescending;
         public int MaxOutputConfigs { get; set; } = 0; // 0 = unlimited

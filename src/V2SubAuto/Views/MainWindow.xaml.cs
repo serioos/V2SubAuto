@@ -23,6 +23,8 @@ namespace V2SubAuto.Views
         private static readonly SolidColorBrush BrushCoreMissing = CreateFrozenBrush(251, 191, 36);
         private static readonly SolidColorBrush BrushBadgeRunning = CreateFrozenBrush(30, 58, 95);
         private static readonly SolidColorBrush BrushBadgeIdle = CreateFrozenBrush(15, 46, 34);
+        private static readonly SolidColorBrush BrushLanActive = CreateFrozenBrush(52, 211, 153);
+        private static readonly SolidColorBrush BrushLanMuted = CreateFrozenBrush(148, 163, 184);
 
         private AppSettings _settings;
         private readonly SettingsService _settingsService;
@@ -105,9 +107,33 @@ namespace V2SubAuto.Views
             }
         }
 
-        private void LoadSettingsIntoUi()
+        private void UpdateSubscriptionUrlDisplay()
         {
             TxtSubUrl.Text = _localServer.SubscriptionUrl;
+
+            if (!_localServer.AllowLanAccess)
+            {
+                TxtLanSubUrl.Text = "Disabled (enable in Settings)";
+                TxtLanSubUrl.Foreground = BrushLanMuted;
+                BtnCopyLanUrl.IsEnabled = false;
+            }
+            else if (!string.IsNullOrEmpty(_localServer.LanSubscriptionUrl))
+            {
+                TxtLanSubUrl.Text = _localServer.LanSubscriptionUrl;
+                TxtLanSubUrl.Foreground = BrushLanActive;
+                BtnCopyLanUrl.IsEnabled = true;
+            }
+            else
+            {
+                TxtLanSubUrl.Text = $"Listening on 0.0.0.0:{_localServer.Port} (no LAN IP detected)";
+                TxtLanSubUrl.Foreground = BrushLanMuted;
+                BtnCopyLanUrl.IsEnabled = false;
+            }
+        }
+
+        private void LoadSettingsIntoUi()
+        {
+            UpdateSubscriptionUrlDisplay();
 
             _subscriptions.Clear();
             foreach (var sub in _settings.Subscriptions)
@@ -128,6 +154,7 @@ namespace V2SubAuto.Views
             TxtIntervalMin.Text = _settings.RefreshIntervalMinutes.ToString(CultureInfo.InvariantCulture);
 
             TxtLocalPort.Text = _settings.LocalServerPort.ToString(CultureInfo.InvariantCulture);
+            ChkAllowLan.IsChecked = _settings.AllowLanAccess;
             ChkAppendMetrics.IsChecked = _settings.AppendMetricsToRemarks;
             CmbSortOrder.SelectedIndex = _settings.OutputSortMode == SortOrderMode.DelayAscending ? 1 : 0;
             TxtMaxOutput.Text = _settings.MaxOutputConfigs.ToString(CultureInfo.InvariantCulture);
@@ -138,6 +165,7 @@ namespace V2SubAuto.Views
             ChkStepSpeedTest.IsChecked = _settings.EnableSpeedTest;
 
             ChkKeepOlderDedup.IsChecked = _settings.KeepOlderDedupl;
+            ChkAllowInsecure.IsChecked = _settings.AllowInsecureAndUnencrypted;
             TxtTcpingBatch.Text = _settings.TcpingBatchSize.ToString(CultureInfo.InvariantCulture);
             TxtTcpingTimeout.Text = _settings.TcpingTimeoutSeconds.ToString(CultureInfo.InvariantCulture);
             TxtRealPingBatch.Text = _settings.RealPingBatchSize.ToString(CultureInfo.InvariantCulture);
@@ -268,6 +296,17 @@ namespace V2SubAuto.Views
             catch { }
         }
 
+        private void BtnCopyLanUrl_Click(object sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrEmpty(_localServer.LanSubscriptionUrl)) return;
+            try
+            {
+                Clipboard.SetText(_localServer.LanSubscriptionUrl);
+                AppendLog($"[{DateTime.Now:HH:mm:ss}] Copied LAN subscription URL: {_localServer.LanSubscriptionUrl}");
+            }
+            catch { }
+        }
+
         private void BtnAddSub_Click(object sender, RoutedEventArgs e)
         {
             var url = TxtNewSubUrl.Text.Trim();
@@ -382,6 +421,7 @@ namespace V2SubAuto.Views
                     .ToList();
 
                 int oldPort = _settings.LocalServerPort;
+                bool oldAllowLan = _settings.AllowLanAccess;
 
                 _settings.AutoStartWithWindows = ChkAutoStart.IsChecked == true;
                 _settings.StartMinimizedToTray = ChkStartMinimized.IsChecked == true;
@@ -389,6 +429,7 @@ namespace V2SubAuto.Views
                 _settings.AutoScheduleEnabled = ChkAutoSchedule.IsChecked == true;
                 _settings.RefreshIntervalMinutes = interval;
                 _settings.LocalServerPort = port;
+                _settings.AllowLanAccess = ChkAllowLan.IsChecked == true;
 
                 _settings.AppendMetricsToRemarks = ChkAppendMetrics.IsChecked == true;
                 _settings.OutputSortMode = CmbSortOrder.SelectedIndex == 1
@@ -402,6 +443,7 @@ namespace V2SubAuto.Views
                 _settings.EnableSpeedTest = ChkStepSpeedTest.IsChecked == true;
 
                 _settings.KeepOlderDedupl = ChkKeepOlderDedup.IsChecked == true;
+                _settings.AllowInsecureAndUnencrypted = ChkAllowInsecure.IsChecked == true;
                 _settings.TcpingBatchSize = tcpBatch;
                 _settings.TcpingTimeoutSeconds = tcpTimeout;
                 _settings.RealPingBatchSize = rpBatch;
@@ -425,14 +467,14 @@ namespace V2SubAuto.Views
                 AutoStartupService.Apply(_settings.AutoStartWithWindows);
 
                 bool portWarning = false;
-                if (oldPort != _settings.LocalServerPort || !_localServer.IsRunning)
+                if (oldPort != _settings.LocalServerPort || oldAllowLan != _settings.AllowLanAccess || !_localServer.IsRunning)
                 {
-                    bool started = _localServer.Start(_settings.LocalServerPort);
-                    TxtSubUrl.Text = _localServer.SubscriptionUrl;
+                    bool started = _localServer.Start(_settings.LocalServerPort, _settings.AllowLanAccess);
+                    UpdateSubscriptionUrlDisplay();
                     if (!started)
                     {
                         portWarning = true;
-                        LogWarning($"Could not bind local server to port {_settings.LocalServerPort}.");
+                        LogWarning($"Could not bind subscription server to port {_settings.LocalServerPort}.");
                     }
                 }
 
@@ -442,7 +484,7 @@ namespace V2SubAuto.Views
                 AppendLog($"[{DateTime.Now:HH:mm:ss}] Settings saved.");
                 MessageBox.Show(
                     portWarning
-                        ? $"Settings saved, but the local server could not bind to port {_settings.LocalServerPort}. Try another port."
+                        ? $"Settings saved, but the subscription server could not bind to port {_settings.LocalServerPort}. Try another port."
                         : "Settings saved and applied.",
                     "V2SubAuto",
                     MessageBoxButton.OK,
