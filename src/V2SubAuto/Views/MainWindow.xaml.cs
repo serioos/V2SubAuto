@@ -377,6 +377,89 @@ namespace V2SubAuto.Views
             SaveSubscriptionsToSettings();
         }
 
+        private void BtnImportSubs_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = "Import Subscription URLs",
+                Filter = "Text Files (*.txt)|*.txt|All Files (*.*)|*.*",
+                CheckFileExists = true,
+                Multiselect = false
+            };
+
+            if (dialog.ShowDialog(this) != true)
+                return;
+
+            string[] lines;
+            try
+            {
+                lines = File.ReadAllLines(dialog.FileName);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"Could not read the selected file:
+{ex.Message}",
+                    "V2SubAuto",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                return;
+            }
+
+            CommitPendingSubsGridEdits();
+
+            var result = SubscriptionImportParser.ParseLines(
+                lines,
+                _subscriptions.Select(x => x.Url),
+                _subscriptions.Count + 1);
+
+            if (result.Added.Count > 0)
+            {
+                foreach (var sub in result.Added)
+                {
+                    _subscriptions.Add(sub);
+                }
+
+                SaveSubscriptionsToSettings(logChange: false);
+            }
+
+            var notes = new List<string>();
+            if (result.DuplicateCount > 0)
+                notes.Add($"{result.DuplicateCount} duplicate(s) skipped");
+            if (result.InvalidLineCount > 0)
+                notes.Add($"{result.InvalidLineCount} invalid line(s) ignored");
+
+            var noteSuffix = notes.Count > 0 ? $" ({string.Join(", ", notes)})" : string.Empty;
+            var fileName = Path.GetFileName(dialog.FileName);
+
+            if (result.Added.Count > 0)
+            {
+                AppendLog($"[{DateTime.Now:HH:mm:ss}] Imported {result.Added.Count} subscription(s) from '{fileName}'{noteSuffix}.");
+                MessageBox.Show(
+                    $"Imported {result.Added.Count} subscription(s) from {fileName}{noteSuffix}.",
+                    "V2SubAuto",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
+            else if (result.DuplicateCount > 0)
+            {
+                AppendLog($"[{DateTime.Now:HH:mm:ss}] No new subscriptions imported from '{fileName}'{noteSuffix}.");
+                MessageBox.Show(
+                    $"All valid URLs in {fileName} are already in your subscriptions list{noteSuffix}.",
+                    "V2SubAuto",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
+            else
+            {
+                MessageBox.Show(
+                    $"No valid http:// or https:// URLs were found in {fileName}.",
+                    "V2SubAuto",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+        }
+
         private void BtnDeleteSub_Click(object sender, RoutedEventArgs e)
         {
             CommitPendingSubsGridEdits();

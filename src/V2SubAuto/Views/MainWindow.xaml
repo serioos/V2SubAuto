@@ -195,10 +195,12 @@
                                 <ColumnDefinition Width="180"/>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
                             <TextBox x:Name="TxtNewSubName" Grid.Column="0" Margin="0,0,8,0" ToolTip="Subscription Name"/>
                             <TextBox x:Name="TxtNewSubUrl" Grid.Column="1" Margin="0,0,8,0" ToolTip="https://..."/>
-                            <Button Grid.Column="2" Content="+ Add URL" Style="{StaticResource PrimaryButton}" Click="BtnAddSub_Click"/>
+                            <Button Grid.Column="2" Content="+ Add URL" Style="{StaticResource PrimaryButton}" Margin="0,0,8,0" Click="BtnAddSub_Click"/>
+                            <Button Grid.Column="3" Content="Import .txt..." Style="{StaticResource SecondaryButton}" ToolTip="Import subscription URLs from a text file (one URL per line, or Name | URL)" Click="BtnImportSubs_Click"/>
                         </Grid>
 
                         <DataGrid x:Name="SubsGrid" Grid.Row="1"
