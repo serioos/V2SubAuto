@@ -7,9 +7,9 @@ Lightweight, zero-dependency Windows 11 (.NET 8 WPF) system-tray app that automa
 1. **Windows 11 Auto-Start & Tray**: Registers under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (matching [AutoStartupHandler.cs](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/AutoStartupHandler.cs)), starts minimized in the system tray on login, and immediately kicks off a pipeline run.
 2. **Multi-URL Subscription Fetch**: Periodically downloads and decodes Base64 or plain-text config lists (`vmess`, `vless`, `trojan`, `ss`, `hysteria2`/`hy2`, `tuic`, `socks`, `wireguard`).
 3. **Remove Duplicates**: Compares the exact same protocol, endpoint, credential, transport, and TLS/Reality fields as v2rayN's [`DedupServerList` / `CompareProfileItem`](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Handler/Data/ConfigDbHandler.cs) in O(N) time, honoring `KeepOlderDedupl`.
-4. **Test Tcping + Remove Invalids**: Batched parallel TCP socket connects with 4-second timeout (matching [`RunTcpingAsync` / `GetTcpingTime`](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Services/SpeedtestService.cs)), removing all configs where `Delay == -1`.
+4. **Test Tcping + Remove Invalids**: Batched parallel TCP socket connects with 4-second timeout (matching [`RunTcpingAsync` / `GetTcpingTime`](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Services/SpeedtestService.cs)), automatically bypassing UDP-only protocols (`Hysteria2`, `TUIC`, `WireGuard`) and removing all TCP configs where `Delay == -1`.
 5. **Test Real Delay + Remove Invalids**: Splits configs by core (`xray.exe` vs `sing-box.exe`), generates multi-inbound batch configs with automatic bad-node ejection and batch-size halving on failure, and runs 2× HTTP GET against `RealPingTestUrl` (default `https://www.google.com/generate_204`). Optional **Allow insecure TLS & unencrypted VLESS/Trojan connections** setting routes unencrypted/insecure nodes through `sing-box` (or a local loopback relay for Xray-only transports) so they can be tested without triggering Xray-core v26+ startup errors.
-6. **Test Latency & Download Speed + Filter**: Runs concurrent per-node Mixedtest (`MixedConcurrencyCount`), verifying Real Delay and measuring peak download speed in **MB/s** (`maxSpeed / 1_000_000`, matching [`DownloadDataAsync4Speed`](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Helper/DownloaderHelper.cs)), then drops invalids and configs below your minimum MB/s threshold.
+6. **Test Latency & Download Speed + Filter**: Runs concurrent batched speedtests (`MixedConcurrencyCount`) across both `xray.exe` and `sing-box.exe`, reusing valid Real Delay measurements from Step 5 when enabled (or measuring Real Delay inline when Step 5 is skipped), measuring peak download speed in **MB/s** (`maxSpeed / 1_000_000`, matching [`DownloadDataAsync4Speed`](https://github.com/2dust/v2rayN/blob/master/v2rayN/ServiceLib/Helper/DownloaderHelper.cs)), then dropping invalids and configs below your minimum MB/s threshold.
 7. **Local & LAN Subscription Server**: Serves surviving configs over `TcpListener` (no administrator privileges required) at `http://127.0.0.1:18080/sub` and `http://<LAN-IP>:18080/sub` (Base64 for v2rayN and mobile/LAN clients), `/raw` (plain text), and `/status` (JSON), and caches the last good list on disk for instant availability after reboot.
 
 ## Building with GitHub Actions
@@ -26,7 +26,7 @@ Lightweight, zero-dependency Windows 11 (.NET 8 WPF) system-tray app that automa
 Requires the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0):
 
 ```powershell
-dotnet publish src/V2SubAuto/V2SubAuto.csproj -c Release -r win-x64 --self-contained true -o publish/V2SubAuto
+dotnet publish src/V2SubAuto/V2SubAuto.csproj -c Release -r win-x64 --self-contained true -p:PublishReadyToRun=true -o publish/V2SubAuto
 ```
 
 Launch `publish/V2SubAuto/V2SubAuto.exe`, open **Settings**, and click **Download / Update Latest Xray & sing-box** to install the cores automatically.

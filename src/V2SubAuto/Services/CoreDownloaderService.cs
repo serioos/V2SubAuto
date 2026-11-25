@@ -58,8 +58,15 @@ namespace V2SubAuto.Services
             CancellationToken ct)
         {
             string? tempZip = null;
+            string? tempExe = null;
             try
             {
+                if (string.IsNullOrWhiteSpace(targetExePath))
+                {
+                    log($"Target path for {exeFileName} is empty.");
+                    return false;
+                }
+
                 log($"Checking latest release for {exeFileName}...");
                 var json = await http.GetStringAsync(releaseApiUrl, ct).ConfigureAwait(false);
                 using var doc = JsonDocument.Parse(json);
@@ -93,8 +100,12 @@ namespace V2SubAuto.Services
                     await resp.Content.CopyToAsync(fs, ct).ConfigureAwait(false);
                 }
 
-                var targetDir = Path.GetDirectoryName(targetExePath)!;
-                Directory.CreateDirectory(targetDir);
+                var fullTargetPath = Path.GetFullPath(targetExePath);
+                var targetDir = Path.GetDirectoryName(fullTargetPath);
+                if (!string.IsNullOrWhiteSpace(targetDir))
+                {
+                    Directory.CreateDirectory(targetDir);
+                }
 
                 using var archive = ZipFile.OpenRead(tempZip);
                 var entry = archive.Entries.FirstOrDefault(e =>
@@ -105,8 +116,13 @@ namespace V2SubAuto.Services
                     return false;
                 }
 
-                entry.ExtractToFile(targetExePath, overwrite: true);
-                log($"Installed {exeFileName} -> {targetExePath}");
+                // Extract to a staging file in the same directory and atomically swap
+                tempExe = fullTargetPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                entry.ExtractToFile(tempExe, overwrite: true);
+                File.Move(tempExe, fullTargetPath, overwrite: true);
+                tempExe = null;
+
+                log($"Installed {exeFileName} -> {fullTargetPath}");
                 return true;
             }
             catch (Exception ex)
@@ -116,6 +132,10 @@ namespace V2SubAuto.Services
             }
             finally
             {
+                if (tempExe != null)
+                {
+                    try { if (File.Exists(tempExe)) File.Delete(tempExe); } catch { }
+                }
                 if (tempZip != null)
                 {
                     try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }

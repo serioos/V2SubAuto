@@ -14,6 +14,9 @@
     <Description>Lightweight Windows 11 tray automation app replicating V2RayN's subscription, deduplication, Tcping, Real Delay, and Speedtest pipeline.</Description>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <PublishSingleFile>false</PublishSingleFile>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
   </PropertyGroup>

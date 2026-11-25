@@ -17,7 +17,7 @@ namespace V2SubAuto.Services
             if (string.IsNullOrWhiteSpace(rawText))
                 return results;
 
-            var trimmed = rawText.Trim();
+            var trimmed = rawText.Trim().TrimStart('\uFEFF');
             string decoded = trimmed;
 
             // If it does not directly contain protocol schemes, try Base64 decoding
@@ -33,7 +33,7 @@ namespace V2SubAuto.Services
             var lines = decoded.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
             foreach (var rawLine in lines)
             {
-                var line = rawLine.Trim();
+                var line = rawLine.Trim().TrimStart('\uFEFF');
                 if (string.IsNullOrEmpty(line) || line.StartsWith('#'))
                     continue;
 
@@ -80,6 +80,9 @@ namespace V2SubAuto.Services
         private static ProxyNode? ParseVmess(string rawUri, string sourceName)
         {
             var payload = rawUri.Substring("vmess://".Length).Trim();
+            var hashIdx = payload.IndexOf('#');
+            if (hashIdx >= 0) payload = payload[..hashIdx];
+
             var jsonStr = TryDecodeBase64(payload);
             if (string.IsNullOrWhiteSpace(jsonStr))
                 return null;
@@ -99,6 +102,7 @@ namespace V2SubAuto.Services
             var path = GetJsonString(root, "path");
             var tls = GetJsonString(root, "tls");
             var sni = GetJsonString(root, "sni");
+            bool isTls = string.Equals(tls, "tls", StringComparison.OrdinalIgnoreCase);
 
             var node = new ProxyNode
             {
@@ -112,8 +116,8 @@ namespace V2SubAuto.Services
                 VmessAlterId = GetJsonInt(root, "aid"),
                 VmessSecurity = GetJsonString(root, "scy", "auto"),
                 Network = net,
-                StreamSecurity = string.Equals(tls, "tls", StringComparison.OrdinalIgnoreCase) ? "tls" : string.Empty,
-                Sni = !string.IsNullOrWhiteSpace(sni) ? sni : host,
+                StreamSecurity = isTls ? "tls" : string.Empty,
+                Sni = isTls ? (!string.IsNullOrWhiteSpace(sni) ? sni : host) : string.Empty,
                 Alpn = GetJsonString(root, "alpn"),
                 Fingerprint = GetJsonString(root, "fp"),
                 AllowInsecure = GetJsonBool(root, "insecure") || GetJsonBool(root, "allowInsecure")
@@ -126,9 +130,11 @@ namespace V2SubAuto.Services
 
         private static ProxyNode? ParseVless(string rawUri, string sourceName)
         {
-            var uri = new Uri(rawUri);
-            var query = ParseQuery(uri.Query);
-            var remarks = DecodeFragment(uri.Fragment, $"{uri.Host}:{uri.Port}");
+            if (!TrySplitProxyUri(rawUri, "vless://", defaultPort: 0, out var userInfo, out var host, out var port, out var queryPart, out var fragment))
+                return null;
+
+            var query = ParseQuery(queryPart);
+            var remarks = DecodeFragment(fragment, $"{host}:{port}");
             var net = NormalizeNetwork(GetQuery(query, "type", "tcp"));
             var security = GetQuery(query, "security", string.Empty).ToLowerInvariant();
             if (security == "none") security = string.Empty;
@@ -139,9 +145,9 @@ namespace V2SubAuto.Services
                 SourceName = sourceName,
                 Protocol = ProxyProtocol.Vless,
                 Remarks = remarks,
-                Address = UnwrapIpv6(uri.Host),
-                Port = uri.Port,
-                Password = Uri.UnescapeDataString(uri.UserInfo),
+                Address = UnwrapIpv6(host),
+                Port = port,
+                Password = SafeUnescape(userInfo),
                 VlessEncryption = GetQuery(query, "encryption", "none"),
                 Flow = GetQuery(query, "flow", string.Empty),
                 Network = net,
@@ -171,9 +177,11 @@ namespace V2SubAuto.Services
 
         private static ProxyNode? ParseTrojan(string rawUri, string sourceName)
         {
-            var uri = new Uri(rawUri);
-            var query = ParseQuery(uri.Query);
-            var remarks = DecodeFragment(uri.Fragment, $"{uri.Host}:{uri.Port}");
+            if (!TrySplitProxyUri(rawUri, "trojan://", defaultPort: 0, out var userInfo, out var host, out var port, out var queryPart, out var fragment))
+                return null;
+
+            var query = ParseQuery(queryPart);
+            var remarks = DecodeFragment(fragment, $"{host}:{port}");
             var net = NormalizeNetwork(GetQuery(query, "type", "tcp"));
             var security = GetQuery(query, "security", "tls").ToLowerInvariant();
             if (security == "none") security = string.Empty;
@@ -184,9 +192,9 @@ namespace V2SubAuto.Services
                 SourceName = sourceName,
                 Protocol = ProxyProtocol.Trojan,
                 Remarks = remarks,
-                Address = UnwrapIpv6(uri.Host),
-                Port = uri.Port,
-                Password = Uri.UnescapeDataString(uri.UserInfo),
+                Address = UnwrapIpv6(host),
+                Port = port,
+                Password = SafeUnescape(userInfo),
                 Flow = GetQuery(query, "flow", string.Empty),
                 Network = net,
                 StreamSecurity = security,
@@ -220,14 +228,17 @@ namespace V2SubAuto.Services
             var hashIdx = body.IndexOf('#');
             if (hashIdx >= 0)
             {
-                remarks = Uri.UnescapeDataString(body[(hashIdx + 1)..]);
+                remarks = SafeUnescape(body[(hashIdx + 1)..]);
                 body = body[..hashIdx];
             }
 
-            // Strip optional plugin query
+            // Preserve optional plugin query for deduplication
+            string ssPlugin = string.Empty;
             var qIdx = body.IndexOf('?');
             if (qIdx >= 0)
             {
+                var qDict = ParseQuery(body[qIdx..]);
+                ssPlugin = GetQuery(qDict, "plugin", string.Empty);
                 body = body[..qIdx];
             }
 
@@ -245,7 +256,7 @@ namespace V2SubAuto.Services
                 }
                 else
                 {
-                    userInfoPart = Uri.UnescapeDataString(userInfoPart);
+                    userInfoPart = SafeUnescape(userInfoPart);
                 }
 
                 var colon = userInfoPart.IndexOf(':');
@@ -279,9 +290,10 @@ namespace V2SubAuto.Services
                 SourceName = sourceName,
                 Protocol = ProxyProtocol.Shadowsocks,
                 Remarks = string.IsNullOrWhiteSpace(remarks) ? $"{host}:{port}" : remarks,
-                Address = host,
+                Address = UnwrapIpv6(host),
                 Port = port,
                 SsMethod = method,
+                SsPlugin = ssPlugin,
                 Password = password,
                 Network = "tcp"
             };
@@ -289,13 +301,16 @@ namespace V2SubAuto.Services
 
         private static ProxyNode? ParseHysteria2(string rawUri, string sourceName)
         {
-            var normalized = rawUri.StartsWith("hy2://", StringComparison.OrdinalIgnoreCase)
-                ? "hysteria2://" + rawUri.Substring("hy2://".Length)
-                : rawUri;
+            var schemePrefix = rawUri.StartsWith("hy2://", StringComparison.OrdinalIgnoreCase)
+                ? "hy2://"
+                : "hysteria2://";
 
-            var uri = new Uri(normalized);
-            var query = ParseQuery(uri.Query);
-            var remarks = DecodeFragment(uri.Fragment, $"{uri.Host}:{uri.Port}");
+            if (!TrySplitProxyUri(rawUri, schemePrefix, defaultPort: 443, out var userInfo, out var host, out var port, out var queryPart, out var fragment))
+                return null;
+
+            var query = ParseQuery(queryPart);
+            var cleanHost = UnwrapIpv6(host);
+            var remarks = DecodeFragment(fragment, $"{cleanHost}:{port}");
 
             return new ProxyNode
             {
@@ -303,12 +318,12 @@ namespace V2SubAuto.Services
                 SourceName = sourceName,
                 Protocol = ProxyProtocol.Hysteria2,
                 Remarks = remarks,
-                Address = UnwrapIpv6(uri.Host),
-                Port = uri.Port > 0 ? uri.Port : 443,
-                Password = Uri.UnescapeDataString(uri.UserInfo),
+                Address = cleanHost,
+                Port = port,
+                Password = SafeUnescape(userInfo),
                 SalamanderPass = GetQuery(query, "obfs-password", string.Empty),
                 StreamSecurity = "tls",
-                Sni = GetQuery(query, "sni", UnwrapIpv6(uri.Host)),
+                Sni = GetQuery(query, "sni", cleanHost),
                 Alpn = GetQuery(query, "alpn", string.Empty),
                 AllowInsecure = IsTrue(GetQuery(query, "insecure", GetQuery(query, "allowInsecure", "0")))
             };
@@ -316,11 +331,14 @@ namespace V2SubAuto.Services
 
         private static ProxyNode? ParseTuic(string rawUri, string sourceName)
         {
-            var uri = new Uri(rawUri);
-            var query = ParseQuery(uri.Query);
-            var remarks = DecodeFragment(uri.Fragment, $"{uri.Host}:{uri.Port}");
+            if (!TrySplitProxyUri(rawUri, "tuic://", defaultPort: 443, out var rawUserInfo, out var host, out var port, out var queryPart, out var fragment))
+                return null;
 
-            var userInfo = Uri.UnescapeDataString(uri.UserInfo);
+            var query = ParseQuery(queryPart);
+            var cleanHost = UnwrapIpv6(host);
+            var remarks = DecodeFragment(fragment, $"{cleanHost}:{port}");
+
+            var userInfo = SafeUnescape(rawUserInfo);
             var parts = userInfo.Split(':', 2);
             var uuid = parts.Length > 0 ? parts[0] : string.Empty;
             var password = parts.Length > 1 ? parts[1] : string.Empty;
@@ -331,13 +349,13 @@ namespace V2SubAuto.Services
                 SourceName = sourceName,
                 Protocol = ProxyProtocol.Tuic,
                 Remarks = remarks,
-                Address = UnwrapIpv6(uri.Host),
-                Port = uri.Port > 0 ? uri.Port : 443,
+                Address = cleanHost,
+                Port = port,
                 Username = uuid,
                 Password = password,
                 CongestionControl = GetQuery(query, "congestion_control", "bbr"),
                 StreamSecurity = "tls",
-                Sni = GetQuery(query, "sni", UnwrapIpv6(uri.Host)),
+                Sni = GetQuery(query, "sni", cleanHost),
                 Alpn = GetQuery(query, "alpn", "h3"),
                 AllowInsecure = IsTrue(GetQuery(query, "allow_insecure", GetQuery(query, "insecure", "0")))
             };
@@ -345,20 +363,23 @@ namespace V2SubAuto.Services
 
         private static ProxyNode? ParseSocks(string rawUri, string sourceName)
         {
-            var uri = new Uri(rawUri);
-            var remarks = DecodeFragment(uri.Fragment, $"{uri.Host}:{uri.Port}");
+            if (!TrySplitProxyUri(rawUri, "socks://", defaultPort: 0, out var rawUserInfo, out var host, out var port, out _, out var fragment))
+                return null;
+
+            var cleanHost = UnwrapIpv6(host);
+            var remarks = DecodeFragment(fragment, $"{cleanHost}:{port}");
             string user = string.Empty, pass = string.Empty;
 
-            if (!string.IsNullOrEmpty(uri.UserInfo))
+            if (!string.IsNullOrEmpty(rawUserInfo))
             {
-                var info = uri.UserInfo;
+                var info = rawUserInfo;
                 if (!info.Contains(':'))
                 {
                     info = TryDecodeBase64(info) ?? info;
                 }
                 var parts = info.Split(':', 2);
-                user = Uri.UnescapeDataString(parts[0]);
-                if (parts.Length > 1) pass = Uri.UnescapeDataString(parts[1]);
+                user = SafeUnescape(parts[0]);
+                if (parts.Length > 1) pass = SafeUnescape(parts[1]);
             }
 
             return new ProxyNode
@@ -367,8 +388,8 @@ namespace V2SubAuto.Services
                 SourceName = sourceName,
                 Protocol = ProxyProtocol.Socks,
                 Remarks = remarks,
-                Address = UnwrapIpv6(uri.Host),
-                Port = uri.Port,
+                Address = cleanHost,
+                Port = port,
                 Username = user,
                 Password = pass
             };
@@ -376,35 +397,16 @@ namespace V2SubAuto.Services
 
         private static ProxyNode? ParseWireGuard(string rawUri, string sourceName)
         {
-            // Manual parsing handles unescaped '/' and '+' inside Base64 WireGuard private keys
-            var body = rawUri.Substring("wireguard://".Length);
-            string fragment = string.Empty;
-            var hashIdx = body.IndexOf('#');
-            if (hashIdx >= 0)
-            {
-                fragment = body[hashIdx..];
-                body = body[..hashIdx];
-            }
-
-            string queryPart = string.Empty;
-            var qIdx = body.IndexOf('?');
-            if (qIdx >= 0)
-            {
-                queryPart = body[qIdx..];
-                body = body[..qIdx];
-            }
-
-            var atIdx = body.LastIndexOf('@');
-            if (atIdx <= 0)
+            if (!TrySplitProxyUri(rawUri, "wireguard://", defaultPort: 0, out var rawUserInfo, out var host, out var port, out var queryPart, out var fragment))
                 return null;
 
-            var privateKey = Uri.UnescapeDataString(body[..atIdx]).Trim();
-            var hostPortPart = body[(atIdx + 1)..];
-            if (!TrySplitHostPort(hostPortPart, out var host, out var port))
+            if (string.IsNullOrEmpty(rawUserInfo))
                 return null;
 
+            var privateKey = SafeUnescape(rawUserInfo).Trim();
             var query = ParseQuery(queryPart);
-            var remarks = DecodeFragment(fragment, $"{host}:{port}");
+            var cleanHost = UnwrapIpv6(host);
+            var remarks = DecodeFragment(fragment, $"{cleanHost}:{port}");
 
             int.TryParse(GetQuery(query, "mtu", "1280"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var mtu);
             if (mtu <= 0) mtu = 1280;
@@ -415,7 +417,7 @@ namespace V2SubAuto.Services
                 SourceName = sourceName,
                 Protocol = ProxyProtocol.WireGuard,
                 Remarks = remarks,
-                Address = UnwrapIpv6(host),
+                Address = cleanHost,
                 Port = port,
                 Password = privateKey,
                 PublicKey = GetQuery(query, "publickey", string.Empty),
@@ -423,6 +425,79 @@ namespace V2SubAuto.Services
                 WgLocalAddress = GetQuery(query, "address", "172.16.0.2/32"),
                 WgMtu = mtu
             };
+        }
+
+        /// <summary>
+        /// Splits scheme://[userinfo@]host[:port][/path][?query][#fragment] without throwing on unescaped
+        /// password characters (%, +, /, [, ], etc.) that System.Uri rejects.
+        /// </summary>
+        private static bool TrySplitProxyUri(
+            string rawUri,
+            string schemePrefix,
+            int defaultPort,
+            out string userInfo,
+            out string host,
+            out int port,
+            out string queryPart,
+            out string fragment)
+        {
+            userInfo = string.Empty;
+            host = string.Empty;
+            port = 0;
+            queryPart = string.Empty;
+            fragment = string.Empty;
+
+            if (!rawUri.StartsWith(schemePrefix, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var body = rawUri.Substring(schemePrefix.Length);
+
+            var hashIdx = body.IndexOf('#');
+            if (hashIdx >= 0)
+            {
+                fragment = body[hashIdx..];
+                body = body[..hashIdx];
+            }
+
+            var qIdx = body.IndexOf('?');
+            if (qIdx >= 0)
+            {
+                queryPart = body[qIdx..];
+                body = body[..qIdx];
+            }
+
+            // Strip any path segment after the authority (e.g. host:port/...)
+            string authority = body;
+            var atIdx = authority.LastIndexOf('@');
+            int slashSearchStart = atIdx >= 0 ? atIdx + 1 : 0;
+            var slashIdx = authority.IndexOf('/', slashSearchStart);
+            if (slashIdx >= 0)
+            {
+                authority = authority[..slashIdx];
+            }
+
+            string hostPortPart;
+            if (atIdx >= 0)
+            {
+                userInfo = authority[..atIdx];
+                hostPortPart = authority[(atIdx + 1)..];
+            }
+            else
+            {
+                hostPortPart = authority;
+            }
+
+            if (TrySplitHostPort(hostPortPart, out host, out port))
+                return !string.IsNullOrWhiteSpace(host) && port > 0 && port <= 65535;
+
+            if (defaultPort > 0 && !string.IsNullOrWhiteSpace(hostPortPart))
+            {
+                host = UnwrapIpv6(hostPortPart.Trim().TrimEnd('/'));
+                port = defaultPort;
+                return !string.IsNullOrWhiteSpace(host);
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -447,13 +522,21 @@ namespace V2SubAuto.Services
             {
                 try
                 {
-                    var decoded = TryDecodeBase64(node.RawUri.Substring("vmess://".Length));
+                    var vmessPayload = node.RawUri.Substring("vmess://".Length).Trim();
+                    var vmessHash = vmessPayload.IndexOf('#');
+                    if (vmessHash >= 0) vmessPayload = vmessPayload[..vmessHash];
+
+                    var decoded = TryDecodeBase64(vmessPayload);
                     if (!string.IsNullOrWhiteSpace(decoded))
                     {
                         var jsonNode = JsonNode.Parse(decoded)?.AsObject();
                         if (jsonNode != null)
                         {
-                            var oldPs = jsonNode["ps"]?.GetValue<string>() ?? node.Remarks;
+                            string oldPs = node.Remarks;
+                            if (jsonNode["ps"] is JsonValue jv)
+                            {
+                                oldPs = jv.TryGetValue<string>(out var strPs) ? strPs : jv.ToJsonString();
+                            }
                             jsonNode["ps"] = $"{oldPs} {tag}".Trim();
                             var updated = Convert.ToBase64String(Encoding.UTF8.GetBytes(jsonNode.ToJsonString()));
                             return "vmess://" + updated;
@@ -540,7 +623,7 @@ namespace V2SubAuto.Services
         {
             try
             {
-                var s = input.Trim().Replace("\r", "").Replace("\n", "").Replace(" ", "");
+                var s = input.Trim().TrimStart('\uFEFF').Replace("\r", "").Replace("\n", "").Replace(" ", "");
                 s = s.Replace('-', '+').Replace('_', '/');
                 var mod = s.Length % 4;
                 if (mod > 0) s = s.PadRight(s.Length + (4 - mod), '=');
@@ -553,6 +636,19 @@ namespace V2SubAuto.Services
             }
         }
 
+        private static string SafeUnescape(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+            try
+            {
+                return Uri.UnescapeDataString(value);
+            }
+            catch
+            {
+                return value;
+            }
+        }
+
         private static Dictionary<string, string> ParseQuery(string query)
         {
             var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -561,9 +657,9 @@ namespace V2SubAuto.Services
             foreach (var pair in q.Split('&', StringSplitOptions.RemoveEmptyEntries))
             {
                 var kv = pair.Split('=', 2);
-                var key = Uri.UnescapeDataString(kv[0]);
+                var key = SafeUnescape(kv[0]);
                 // Preserve literal '+' characters (common in Base64 publickey/pbk/reserved parameters)
-                var val = kv.Length > 1 ? Uri.UnescapeDataString(kv[1]) : string.Empty;
+                var val = kv.Length > 1 ? SafeUnescape(kv[1]) : string.Empty;
                 dict[key] = val;
             }
             return dict;
@@ -576,7 +672,7 @@ namespace V2SubAuto.Services
         {
             var f = fragment.TrimStart('#');
             if (string.IsNullOrWhiteSpace(f)) return fallback;
-            try { return Uri.UnescapeDataString(f); } catch { return f; }
+            return SafeUnescape(f);
         }
 
         private static string UnwrapIpv6(string host)

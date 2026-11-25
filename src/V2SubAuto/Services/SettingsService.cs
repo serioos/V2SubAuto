@@ -45,15 +45,31 @@ namespace V2SubAuto.Services
                     var loaded = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions);
                     if (loaded != null)
                     {
+                        var defaultsRef = new AppSettings();
                         loaded.Subscriptions ??= new();
-                        if (loaded.RefreshIntervalMinutes < 1) loaded.RefreshIntervalMinutes = 60;
-                        if (loaded.TcpingBatchSize < 1) loaded.TcpingBatchSize = 1000;
-                        if (loaded.TcpingTimeoutSeconds < 1) loaded.TcpingTimeoutSeconds = 4;
-                        if (loaded.RealPingBatchSize < 1) loaded.RealPingBatchSize = 500;
-                        if (loaded.RealPingTimeoutSeconds < 2) loaded.RealPingTimeoutSeconds = 4;
-                        if (loaded.MixedConcurrencyCount < 1) loaded.MixedConcurrencyCount = 8;
-                        if (loaded.SpeedTestTimeoutSeconds < 2) loaded.SpeedTestTimeoutSeconds = 8;
-                        if (loaded.LocalServerPort < 1024 || loaded.LocalServerPort > 65535) loaded.LocalServerPort = 18080;
+                        if (loaded.RefreshIntervalMinutes < 1) loaded.RefreshIntervalMinutes = defaultsRef.RefreshIntervalMinutes;
+                        if (loaded.TcpingBatchSize < 1) loaded.TcpingBatchSize = defaultsRef.TcpingBatchSize;
+                        if (loaded.TcpingTimeoutSeconds < 1) loaded.TcpingTimeoutSeconds = defaultsRef.TcpingTimeoutSeconds;
+                        if (loaded.RealPingBatchSize < 1)
+                            loaded.RealPingBatchSize = defaultsRef.RealPingBatchSize;
+                        else if (loaded.RealPingBatchSize > AppSettings.MaxRealPingBatchSize)
+                            loaded.RealPingBatchSize = AppSettings.MaxRealPingBatchSize;
+                        if (loaded.RealPingTimeoutSeconds < 2) loaded.RealPingTimeoutSeconds = defaultsRef.RealPingTimeoutSeconds;
+                        if (loaded.BatchDelayIntervalSeconds < 0) loaded.BatchDelayIntervalSeconds = 0;
+                        if (loaded.MixedConcurrencyCount < 1) loaded.MixedConcurrencyCount = defaultsRef.MixedConcurrencyCount;
+                        if (loaded.SpeedTestTimeoutSeconds < 2) loaded.SpeedTestTimeoutSeconds = defaultsRef.SpeedTestTimeoutSeconds;
+                        if (double.IsNaN(loaded.MinDownloadSpeedMBps) || double.IsInfinity(loaded.MinDownloadSpeedMBps) || loaded.MinDownloadSpeedMBps < 0)
+                            loaded.MinDownloadSpeedMBps = defaultsRef.MinDownloadSpeedMBps;
+                        if (loaded.MaxOutputConfigs < 0) loaded.MaxOutputConfigs = 0;
+                        if (loaded.LocalServerPort < 1024 || loaded.LocalServerPort > 65535) loaded.LocalServerPort = defaultsRef.LocalServerPort;
+                        if (!SubscriptionImportParser.TryParseHttpUrl(loaded.RealPingTestUrl, out _))
+                            loaded.RealPingTestUrl = defaultsRef.RealPingTestUrl;
+                        if (!SubscriptionImportParser.TryParseHttpUrl(loaded.SpeedTestUrl, out _))
+                            loaded.SpeedTestUrl = defaultsRef.SpeedTestUrl;
+                        if (string.IsNullOrWhiteSpace(loaded.XrayExecutablePath))
+                            loaded.XrayExecutablePath = defaultsRef.XrayExecutablePath;
+                        if (string.IsNullOrWhiteSpace(loaded.SingboxExecutablePath))
+                            loaded.SingboxExecutablePath = defaultsRef.SingboxExecutablePath;
                         return loaded;
                     }
                 }

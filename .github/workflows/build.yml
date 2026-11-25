@@ -35,6 +35,7 @@ jobs:
       - name: Download latest Xray-core and sing-box binaries
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $headers = @{ "User-Agent" = "V2SubAuto-CI" }
           if ($env:GITHUB_TOKEN) { $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN" }
 
@@ -42,12 +43,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path "publish/V2SubAuto/bin/xray" | Out-Null
           $xrayRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/XTLS/Xray-core/releases/latest" -Headers $headers
           $xrayAsset = $xrayRelease.assets | Where-Object { $_.name -eq "Xray-windows-64.zip" } | Select-Object -First 1
-          if ($xrayAsset) {
-            Invoke-WebRequest -Uri $xrayAsset.browser_download_url -OutFile "xray.zip"
-            Expand-Archive -Path "xray.zip" -DestinationPath "xray_tmp" -Force
-            Copy-Item "xray_tmp/xray.exe" "publish/V2SubAuto/bin/xray/xray.exe" -Force
-            Remove-Item "xray.zip", "xray_tmp" -Recurse -Force
+          if (-not $xrayAsset) {
+            throw "Failed to locate Xray-windows-64.zip in latest Xray-core release."
           }
+          Invoke-WebRequest -Uri $xrayAsset.browser_download_url -OutFile "xray.zip"
+          Expand-Archive -Path "xray.zip" -DestinationPath "xray_tmp" -Force
+          if (-not (Test-Path "xray_tmp/xray.exe")) {
+            throw "xray.exe was not found inside Xray-windows-64.zip."
+          }
+          Copy-Item "xray_tmp/xray.exe" "publish/V2SubAuto/bin/xray/xray.exe" -Force
+          Remove-Item "xray.zip", "xray_tmp" -Recurse -Force
 
           # 2. sing-box
           New-Item -ItemType Directory -Force -Path "publish/V2SubAuto/bin/sing_box" | Out-Null
@@ -55,14 +60,21 @@ jobs:
           $sbAsset = $sbRelease.assets | Where-Object {
             $_.name -like "*-windows-amd64.zip" -and $_.name -notlike "*legacy*" -and $_.name -notlike "*fips*"
           } | Select-Object -First 1
-          if ($sbAsset) {
-            Invoke-WebRequest -Uri $sbAsset.browser_download_url -OutFile "singbox.zip"
-            Expand-Archive -Path "singbox.zip" -DestinationPath "sb_tmp" -Force
-            $sbExe = Get-ChildItem -Path "sb_tmp" -Filter "sing-box.exe" -Recurse | Select-Object -First 1
-            if ($sbExe) {
-              Copy-Item $sbExe.FullName "publish/V2SubAuto/bin/sing_box/sing-box.exe" -Force
-            }
-            Remove-Item "singbox.zip", "sb_tmp" -Recurse -Force
+          if (-not $sbAsset) {
+            throw "Failed to locate windows-amd64.zip in latest sing-box release."
+          }
+          Invoke-WebRequest -Uri $sbAsset.browser_download_url -OutFile "singbox.zip"
+          Expand-Archive -Path "singbox.zip" -DestinationPath "sb_tmp" -Force
+          $sbExe = Get-ChildItem -Path "sb_tmp" -Filter "sing-box.exe" -Recurse | Select-Object -First 1
+          if (-not $sbExe) {
+            throw "sing-box.exe was not found inside sing-box release archive."
+          }
+          Copy-Item $sbExe.FullName "publish/V2SubAuto/bin/sing_box/sing-box.exe" -Force
+          Remove-Item "singbox.zip", "sb_tmp" -Recurse -Force
+
+          # Verify both binaries are present before packaging
+          if (-not (Test-Path "publish/V2SubAuto/bin/xray/xray.exe") -or -not (Test-Path "publish/V2SubAuto/bin/sing_box/sing-box.exe")) {
+            throw "Bundled core verification failed: missing xray.exe or sing-box.exe."
           }
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

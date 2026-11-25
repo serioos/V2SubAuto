@@ -6,6 +6,7 @@ using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -38,6 +39,7 @@ namespace V2SubAuto.Views
         private readonly ConcurrentQueue<string> _pendingLogs = new();
         private readonly DispatcherTimer _logFlushTimer;
         private const int MaxLogLines = 800;
+        private const int LogTrimHysteresis = 100;
 
         private bool _allowClose;
         private bool _isCommittingSubEdit;
@@ -176,7 +178,8 @@ namespace V2SubAuto.Views
             CmbPingUrl.Text = _settings.RealPingTestUrl;
             CmbSpeedUrl.Text = _settings.SpeedTestUrl;
             TxtSpeedTimeout.Text = _settings.SpeedTestTimeoutSeconds.ToString(CultureInfo.InvariantCulture);
-            TxtMinSpeed.Text = _settings.MinDownloadSpeedMBps.ToString("0.0", CultureInfo.InvariantCulture);
+            TxtMinSpeed.Text = _settings.MinDownloadSpeedMBps.ToString("0.##", CultureInfo.InvariantCulture);
+            TxtBatchDelay.Text = _settings.BatchDelayIntervalSeconds.ToString(CultureInfo.InvariantCulture);
 
             TxtXrayPath.Text = _settings.XrayExecutablePath;
             TxtSingboxPath.Text = _settings.SingboxExecutablePath;
@@ -229,22 +232,39 @@ namespace V2SubAuto.Views
         {
             if (_pendingLogs.IsEmpty) return;
 
+            var sb = new StringBuilder();
+            bool hadExisting = _logBuffer.Count > 0;
             bool changed = false;
+
             while (_pendingLogs.TryDequeue(out var line))
             {
                 _logBuffer.AddLast(line);
+                if (hadExisting || sb.Length > 0)
+                    sb.Append(Environment.NewLine);
+                sb.Append(line);
                 changed = true;
             }
 
             if (!changed) return;
 
-            while (_logBuffer.Count > MaxLogLines)
+            bool hasSelection = TxtLogs.SelectionLength > 0;
+            if (_logBuffer.Count > MaxLogLines + LogTrimHysteresis)
             {
-                _logBuffer.RemoveFirst();
-            }
+                while (_logBuffer.Count > MaxLogLines)
+                {
+                    _logBuffer.RemoveFirst();
+                }
 
-            TxtLogs.Text = string.Join(Environment.NewLine, _logBuffer);
-            TxtLogs.ScrollToEnd();
+                TxtLogs.Text = string.Join(Environment.NewLine, _logBuffer);
+                if (!hasSelection)
+                    TxtLogs.ScrollToEnd();
+            }
+            else
+            {
+                TxtLogs.AppendText(sb.ToString());
+                if (!hasSelection)
+                    TxtLogs.ScrollToEnd();
+            }
         }
 
         /// <summary>
@@ -358,13 +378,31 @@ namespace V2SubAuto.Views
         private void BtnAddSub_Click(object sender, RoutedEventArgs e)
         {
             var url = TxtNewSubUrl.Text.Trim();
-            if (string.IsNullOrWhiteSpace(url))
+            if (!SubscriptionImportParser.TryParseHttpUrl(url, out _))
             {
-                MessageBox.Show("Please enter a valid subscription or config list URL.", "V2SubAuto", MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(
+                    "Please enter a valid http:// or https:// subscription URL.",
+                    "V2SubAuto",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
                 return;
             }
 
             CommitPendingSubsGridEdits();
+
+            var normalizedNew = SubscriptionImportParser.NormalizeUrlForDedup(url);
+            bool alreadyExists = _subscriptions.Any(s =>
+                !string.IsNullOrWhiteSpace(s.Url) &&
+                string.Equals(SubscriptionImportParser.NormalizeUrlForDedup(s.Url), normalizedNew, StringComparison.Ordinal));
+            if (alreadyExists)
+            {
+                MessageBox.Show(
+                    "This subscription URL is already in your list.",
+                    "V2SubAuto",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
 
             var name = string.IsNullOrWhiteSpace(TxtNewSubName.Text)
                 ? $"Subscription {_subscriptions.Count + 1}"
@@ -553,8 +591,8 @@ namespace V2SubAuto.Views
                 if (!int.TryParse(TxtTcpingTimeout.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var tcpTimeout) || tcpTimeout < 1)
                     errors.Add("Tcping Timeout (sec) must be a whole number >= 1.");
 
-                if (!int.TryParse(TxtRealPingBatch.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var rpBatch) || rpBatch < 1)
-                    errors.Add("Real Delay Batch must be a whole number >= 1.");
+                if (!int.TryParse(TxtRealPingBatch.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var rpBatch) || rpBatch < 1 || rpBatch > AppSettings.MaxRealPingBatchSize)
+                    errors.Add($"Real Delay Batch must be a whole number between 1 and {AppSettings.MaxRealPingBatchSize}.");
 
                 if (!int.TryParse(TxtRealPingTimeout.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var rpTimeout) || rpTimeout < 2)
                     errors.Add("Real Delay Timeout (sec) must be a whole number >= 2.");
@@ -565,8 +603,19 @@ namespace V2SubAuto.Views
                 if (!int.TryParse(TxtSpeedTimeout.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var spTimeout) || spTimeout < 2)
                     errors.Add("Speedtest Timeout (sec) must be a whole number >= 2.");
 
-                if (!double.TryParse(TxtMinSpeed.Text.Trim().Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out var minSp) || minSp < 0)
+                if (!double.TryParse(TxtMinSpeed.Text.Trim().Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out var minSp) || double.IsNaN(minSp) || double.IsInfinity(minSp) || minSp < 0)
                     errors.Add("Min Download Speed (MB/s) must be a number >= 0.");
+
+                if (!int.TryParse(TxtBatchDelay.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var batchDelay) || batchDelay < 0)
+                    errors.Add("Batch Delay (sec) must be a whole number >= 0.");
+
+                var pingUrl = CmbPingUrl.Text.Trim();
+                if (!SubscriptionImportParser.TryParseHttpUrl(pingUrl, out _))
+                    errors.Add("Real Delay Test URL must be a valid http:// or https:// URL.");
+
+                var speedUrl = CmbSpeedUrl.Text.Trim();
+                if (!SubscriptionImportParser.TryParseHttpUrl(speedUrl, out _))
+                    errors.Add("Download Speed Test URL must be a valid http:// or https:// URL.");
 
                 if (errors.Count > 0)
                 {
@@ -592,6 +641,7 @@ namespace V2SubAuto.Views
 
                 int oldPort = _settings.LocalServerPort;
                 bool oldAllowLan = _settings.AllowLanAccess;
+                bool wasServerRunning = _localServer.IsRunning;
 
                 _settings.AutoStartWithWindows = ChkAutoStart.IsChecked == true;
                 _settings.StartMinimizedToTray = ChkStartMinimized.IsChecked == true;
@@ -618,12 +668,11 @@ namespace V2SubAuto.Views
                 _settings.TcpingTimeoutSeconds = tcpTimeout;
                 _settings.RealPingBatchSize = rpBatch;
                 _settings.RealPingTimeoutSeconds = rpTimeout;
+                _settings.BatchDelayIntervalSeconds = batchDelay;
                 _settings.MixedConcurrencyCount = mixConc;
 
-                if (!string.IsNullOrWhiteSpace(CmbPingUrl.Text))
-                    _settings.RealPingTestUrl = CmbPingUrl.Text.Trim();
-                if (!string.IsNullOrWhiteSpace(CmbSpeedUrl.Text))
-                    _settings.SpeedTestUrl = CmbSpeedUrl.Text.Trim();
+                _settings.RealPingTestUrl = pingUrl;
+                _settings.SpeedTestUrl = speedUrl;
 
                 _settings.SpeedTestTimeoutSeconds = spTimeout;
                 _settings.MinDownloadSpeedMBps = minSp;
@@ -633,19 +682,33 @@ namespace V2SubAuto.Views
                 if (!string.IsNullOrWhiteSpace(TxtSingboxPath.Text))
                     _settings.SingboxExecutablePath = TxtSingboxPath.Text.Trim();
 
-                _settingsService.Save(_settings);
-                AutoStartupService.Apply(_settings.AutoStartWithWindows);
-
                 bool portWarning = false;
-                if (oldPort != _settings.LocalServerPort || oldAllowLan != _settings.AllowLanAccess || !_localServer.IsRunning)
+                if (oldPort != _settings.LocalServerPort || oldAllowLan != _settings.AllowLanAccess || !wasServerRunning)
                 {
                     bool started = _localServer.Start(_settings.LocalServerPort, _settings.AllowLanAccess);
-                    UpdateSubscriptionUrlDisplay();
                     if (!started)
                     {
                         portWarning = true;
                         LogWarning($"Could not bind subscription server to port {_settings.LocalServerPort}.");
+
+                        // Revert port/LAN settings so a failed port is not persisted
+                        if (wasServerRunning && (oldPort != _settings.LocalServerPort || oldAllowLan != _settings.AllowLanAccess))
+                        {
+                            _settings.LocalServerPort = oldPort;
+                            _settings.AllowLanAccess = oldAllowLan;
+                            TxtLocalPort.Text = oldPort.ToString(CultureInfo.InvariantCulture);
+                            ChkAllowLan.IsChecked = oldAllowLan;
+                            _localServer.Start(oldPort, oldAllowLan);
+                        }
                     }
+                    UpdateSubscriptionUrlDisplay();
+                }
+
+                _settingsService.Save(_settings);
+
+                if (!AutoStartupService.Apply(_settings.AutoStartWithWindows))
+                {
+                    LogWarning("Could not update Windows auto-startup registry entry.");
                 }
 
                 _orchestrator.UpdateSettings(_settings);
@@ -654,7 +717,7 @@ namespace V2SubAuto.Views
                 AppendLog($"[{DateTime.Now:HH:mm:ss}] Settings saved.");
                 MessageBox.Show(
                     portWarning
-                        ? $"Settings saved, but the subscription server could not bind to port {_settings.LocalServerPort}. Try another port."
+                        ? $"Settings saved, but the subscription server could not bind to port {port} (reverted to previous working port if available)."
                         : "Settings saved and applied.",
                     "V2SubAuto",
                     MessageBoxButton.OK,
@@ -675,8 +738,18 @@ namespace V2SubAuto.Views
                 if (_orchestrator.CurrentSnapshot.IsRunning)
                 {
                     AppendLog($"[{DateTime.Now:HH:mm:ss}] Cancelling active pipeline run before updating core binaries...");
-                    _orchestrator.CancelCurrentRun();
-                    await Task.Delay(500);
+                }
+
+                using var updateLock = await _orchestrator.TryPauseForCoreUpdateAsync(TimeSpan.FromSeconds(10));
+                if (updateLock == null)
+                {
+                    LogWarning("Timed out waiting for active pipeline run to stop before updating core binaries.");
+                    MessageBox.Show(
+                        "The pipeline is still shutting down. Please wait a moment and try again.",
+                        "V2SubAuto",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    return;
                 }
 
                 var xrayPath = _settingsService.ResolvePath(_settings.XrayExecutablePath);
@@ -691,6 +764,15 @@ namespace V2SubAuto.Views
                     "V2SubAuto",
                     MessageBoxButton.OK,
                     xrayOk && sbOk ? MessageBoxImage.Information : MessageBoxImage.Warning);
+            }
+            catch (Exception ex)
+            {
+                LogWarning($"Core download failed: {ex.Message}");
+                MessageBox.Show(
+                    $"Core download failed: {ex.Message}",
+                    "V2SubAuto",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
             }
             finally
             {

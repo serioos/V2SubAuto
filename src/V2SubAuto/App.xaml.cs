@@ -22,6 +22,8 @@ namespace V2SubAuto
 
         private Mutex? _singleInstanceMutex;
         private System.Windows.Forms.NotifyIcon? _trayIcon;
+        private System.Windows.Forms.ContextMenuStrip? _trayMenu;
+        private Font? _trayOpenFont;
         private Icon? _generatedIcon;
 
         private SettingsService _settingsService = null!;
@@ -39,10 +41,16 @@ namespace V2SubAuto
             base.OnStartup(e);
 
             DispatcherUnhandledException += OnDispatcherUnhandledException;
+            AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
+            TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
 
-            _singleInstanceMutex = new Mutex(true, "V2SubAuto_SingleInstance_Mutex_v1", out bool createdNew);
+            // Per-path mutex aligns with AutoStartupService's per-path portable registration
+            var mutexName = $"V2SubAuto_SingleInstance_{AutoStartupService.GetRegistryValueName()}";
+            _singleInstanceMutex = new Mutex(true, mutexName, out bool createdNew);
             if (!createdNew)
             {
+                _singleInstanceMutex.Dispose();
+                _singleInstanceMutex = null;
                 MessageBox.Show(
                     "V2SubAuto is already running in the system tray.",
                     "V2SubAuto",
@@ -60,21 +68,23 @@ namespace V2SubAuto
             _settings = _settingsService.Load();
 
             // Sync Windows 11 auto-startup registry entry with settings
-            AutoStartupService.Apply(_settings.AutoStartWithWindows);
+            bool autoStartApplied = AutoStartupService.Apply(_settings.AutoStartWithWindows);
 
             _coreRunner = new CoreProcessRunner(_settingsService.BaseDirectory);
             _speedtestEngine = new SpeedtestEngine(_coreRunner, _settingsService);
             _localServer = new LocalSubscriptionServer();
 
             // Pre-load last good subscription so V2RayN can fetch immediately after boot
+            int cachedCount = 0;
+            DateTime? cachedTimestamp = null;
             var (cachedRaw, cachedB64) = _settingsService.LoadLastSubscription();
             if (!string.IsNullOrWhiteSpace(cachedB64))
             {
-                var lineCount = cachedRaw.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
-                var cachedTimestamp = File.Exists(_settingsService.LastSubBase64Path)
+                cachedCount = cachedRaw.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
+                cachedTimestamp = File.Exists(_settingsService.LastSubBase64Path)
                     ? File.GetLastWriteTimeUtc(_settingsService.LastSubBase64Path)
                     : DateTime.UtcNow;
-                _localServer.UpdatePayload(cachedRaw, cachedB64, lineCount, cachedTimestamp);
+                _localServer.UpdatePayload(cachedRaw, cachedB64, cachedCount, cachedTimestamp.Value);
             }
 
             bool serverStarted = _localServer.Start(_settings.LocalServerPort, _settings.AllowLanAccess);
@@ -86,6 +96,11 @@ namespace V2SubAuto
                 _localServer,
                 _coreRunner);
 
+            if (cachedCount > 0)
+            {
+                _orchestrator.InitializeCachedState(cachedCount, cachedTimestamp);
+            }
+
             _mainWindow = new MainWindow(
                 _settings,
                 _settingsService,
@@ -93,7 +108,12 @@ namespace V2SubAuto
                 _orchestrator,
                 RequestExit);
 
-            SetupTrayIcon();
+            SetupTrayIcon(cachedCount);
+
+            if (!autoStartApplied)
+            {
+                _mainWindow.LogWarning("Could not update Windows auto-startup registry entry.");
+            }
 
             if (!serverStarted)
             {
@@ -141,16 +161,43 @@ namespace V2SubAuto
             }
             catch { }
 
+            // Allow fatal runtime exceptions to terminate rather than leaving the app in a corrupted state
+            if (e.Exception is OutOfMemoryException or StackOverflowException or AccessViolationException)
+                return;
+
             e.Handled = true;
         }
 
-        private void SetupTrayIcon()
+        private void OnDomainUnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            if (_isExiting) return;
+            try
+            {
+                var msg = e.ExceptionObject is Exception ex ? ex.Message : e.ExceptionObject?.ToString() ?? "Unknown error";
+                _mainWindow?.LogWarning($"Unhandled background error: {msg}");
+            }
+            catch { }
+        }
+
+        private void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+        {
+            if (_isExiting) return;
+            try
+            {
+                _mainWindow?.LogWarning($"Unobserved task error: {e.Exception.GetBaseException().Message}");
+            }
+            catch { }
+            e.SetObserved();
+        }
+
+        private void SetupTrayIcon(int initialServingCount)
         {
             _generatedIcon = CreateTrayIcon();
-            var menu = new System.Windows.Forms.ContextMenuStrip();
+            _trayMenu = new System.Windows.Forms.ContextMenuStrip();
 
             var openItem = new System.Windows.Forms.ToolStripMenuItem("Open Dashboard");
-            openItem.Font = new Font(openItem.Font, System.Drawing.FontStyle.Bold);
+            _trayOpenFont = new Font(openItem.Font, System.Drawing.FontStyle.Bold);
+            openItem.Font = _trayOpenFont;
             openItem.Click += (_, _) => Dispatcher.Invoke(ShowMainWindow);
 
             var runItem = new System.Windows.Forms.ToolStripMenuItem("Run Pipeline Now");
@@ -191,21 +238,25 @@ namespace V2SubAuto
             var exitItem = new System.Windows.Forms.ToolStripMenuItem("Exit");
             exitItem.Click += (_, _) => Dispatcher.Invoke(RequestExit);
 
-            menu.Items.Add(openItem);
-            menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
-            menu.Items.Add(runItem);
-            menu.Items.Add(stopItem);
-            menu.Items.Add(copyUrlItem);
-            menu.Items.Add(copyLanUrlItem);
-            menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
-            menu.Items.Add(exitItem);
+            _trayMenu.Items.Add(openItem);
+            _trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+            _trayMenu.Items.Add(runItem);
+            _trayMenu.Items.Add(stopItem);
+            _trayMenu.Items.Add(copyUrlItem);
+            _trayMenu.Items.Add(copyLanUrlItem);
+            _trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+            _trayMenu.Items.Add(exitItem);
+
+            var initialTip = initialServingCount > 0
+                ? $"V2SubAuto: Serving {initialServingCount} configs"
+                : "V2SubAuto - Running";
 
             _trayIcon = new System.Windows.Forms.NotifyIcon
             {
                 Icon = _generatedIcon,
-                Text = "V2SubAuto - Running",
+                Text = initialTip.Length > 63 ? initialTip[..63] : initialTip,
                 Visible = true,
-                ContextMenuStrip = menu
+                ContextMenuStrip = _trayMenu
             };
 
             _trayIcon.DoubleClick += (_, _) => Dispatcher.Invoke(ShowMainWindow);
@@ -239,9 +290,16 @@ namespace V2SubAuto
             if (_trayIcon != null)
             {
                 _trayIcon.Visible = false;
+                _trayIcon.ContextMenuStrip = null;
                 _trayIcon.Dispose();
                 _trayIcon = null;
             }
+
+            _trayMenu?.Dispose();
+            _trayMenu = null;
+
+            _trayOpenFont?.Dispose();
+            _trayOpenFont = null;
 
             _generatedIcon?.Dispose();
             _generatedIcon = null;
@@ -251,6 +309,7 @@ namespace V2SubAuto
 
             try { _singleInstanceMutex?.ReleaseMutex(); } catch { }
             _singleInstanceMutex?.Dispose();
+            _singleInstanceMutex = null;
 
             Shutdown();
         }

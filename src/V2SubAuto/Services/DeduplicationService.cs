@@ -48,39 +48,47 @@ namespace V2SubAuto.Services
         private static string BuildComparisonKey(ProxyNode n)
         {
             static string Norm(string? s) => string.IsNullOrEmpty(s) ? string.Empty : s;
+            static string NormLower(string? s) => string.IsNullOrEmpty(s) ? string.Empty : s.Trim().ToLowerInvariant();
 
             // V2RayN exempts Trojan from StreamSecurity comparison:
             // (o.ConfigType == EConfigType.Trojan || o.StreamSecurity == n.StreamSecurity)
-            var streamSec = n.Protocol == ProxyProtocol.Trojan ? "trojan_exempt" : Norm(n.StreamSecurity);
+            var streamSec = n.Protocol == ProxyProtocol.Trojan ? "trojan_exempt" : NormLower(n.StreamSecurity);
 
             return string.Join("\u001F",
                 (int)n.Protocol,
-                Norm(n.Address),
+                NormLower(n.Address),
                 n.Port,
                 Norm(n.Password),
                 Norm(n.Username),
-                Norm(n.VlessEncryption),
-                Norm(n.SsMethod),
-                Norm(n.VmessSecurity),
-                Norm(n.Network),
-                Norm(n.RawHeaderType),
-                Norm(n.Host),
+                NormLower(n.VlessEncryption),
+                NormLower(n.SsMethod),
+                Norm(n.SsPlugin),
+                NormLower(n.VmessSecurity),
+                n.VmessAlterId,
+                NormLower(n.Network),
+                NormLower(n.RawHeaderType),
+                NormLower(n.Host),
                 Norm(n.Path),
-                Norm(n.XhttpMode),
+                NormLower(n.XhttpMode),
                 Norm(n.XhttpExtra),
-                Norm(n.GrpcAuthority),
+                NormLower(n.GrpcAuthority),
                 Norm(n.GrpcServiceName),
-                Norm(n.GrpcMode),
-                Norm(n.KcpHeaderType),
+                NormLower(n.GrpcMode),
+                NormLower(n.KcpHeaderType),
                 Norm(n.KcpSeed),
                 streamSec,
-                Norm(n.Flow),
+                NormLower(n.Flow),
                 Norm(n.SalamanderPass),
-                Norm(n.Sni),
-                Norm(n.Alpn),
-                Norm(n.Fingerprint),
+                NormLower(n.CongestionControl),
+                NormLower(n.Sni),
+                NormLower(n.Alpn),
+                NormLower(n.Fingerprint),
                 Norm(n.PublicKey),
-                Norm(n.ShortId));
+                Norm(n.ShortId),
+                Norm(n.SpiderX),
+                Norm(n.WgLocalAddress),
+                Norm(n.WgReserved),
+                n.WgMtu);
         }
     }
 }

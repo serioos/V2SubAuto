@@ -83,7 +83,8 @@ namespace V2SubAuto.Services
             int probePort,
             CancellationToken ct,
             IReadOnlyCollection<int>? leasedPorts = null,
-            int nodeCount = 1)
+            int nodeCount = 1,
+            int firstProbePort = 0)
         {
             if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
             {
@@ -91,54 +92,56 @@ namespace V2SubAuto.Services
                 return (null, $"Executable not found: {executablePath}");
             }
 
-            Directory.CreateDirectory(_tempDirectory);
-            var configPath = Path.Combine(_tempDirectory, $"test_{coreType}_{Guid.NewGuid():N}.json");
-            await File.WriteAllTextAsync(configPath, jsonConfig, ct).ConfigureAwait(false);
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = executablePath,
-                WorkingDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            psi.ArgumentList.Add("run");
-            psi.ArgumentList.Add("-c");
-            psi.ArgumentList.Add(configPath);
-
-            var outputLock = new object();
-            string? fatalLine = null;
-            string? lastNonWarningLine = null;
-            var stdoutDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var stderrDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-            void AppendOutput(string? line)
-            {
-                if (string.IsNullOrWhiteSpace(line)) return;
-                var trimmed = line.Trim();
-
-                // Ignore Xray deprecation warnings so they never drown out real startup errors
-                if (trimmed.Contains("[Warning]", StringComparison.OrdinalIgnoreCase))
-                    return;
-
-                lock (outputLock)
-                {
-                    lastNonWarningLine = trimmed;
-                    if (trimmed.Contains("Failed to start", StringComparison.OrdinalIgnoreCase) ||
-                        trimmed.Contains("infra/conf", StringComparison.OrdinalIgnoreCase) ||
-                        trimmed.Contains("FATAL", StringComparison.OrdinalIgnoreCase))
-                    {
-                        fatalLine = trimmed;
-                    }
-                }
-            }
-
+            string? configPath = null;
             Process? proc = null;
+
             try
             {
+                Directory.CreateDirectory(_tempDirectory);
+                configPath = Path.Combine(_tempDirectory, $"test_{coreType}_{Guid.NewGuid():N}.json");
+                await File.WriteAllTextAsync(configPath, jsonConfig, ct).ConfigureAwait(false);
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = executablePath,
+                    WorkingDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+
+                psi.ArgumentList.Add("run");
+                psi.ArgumentList.Add("-c");
+                psi.ArgumentList.Add(configPath);
+
+                var outputLock = new object();
+                string? fatalLine = null;
+                string? lastNonWarningLine = null;
+                var stdoutDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var stderrDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+                void AppendOutput(string? line)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) return;
+                    var trimmed = line.Trim();
+
+                    // Ignore Xray deprecation warnings so they never drown out real startup errors
+                    if (trimmed.Contains("[Warning]", StringComparison.OrdinalIgnoreCase))
+                        return;
+
+                    lock (outputLock)
+                    {
+                        lastNonWarningLine = trimmed;
+                        if (trimmed.Contains("Failed to start", StringComparison.OrdinalIgnoreCase) ||
+                            trimmed.Contains("infra/conf", StringComparison.OrdinalIgnoreCase) ||
+                            trimmed.Contains("FATAL", StringComparison.OrdinalIgnoreCase))
+                        {
+                            fatalLine = trimmed;
+                        }
+                    }
+                }
+
                 proc = new Process { StartInfo = psi, EnableRaisingEvents = false };
                 proc.ErrorDataReceived += (_, e) =>
                 {
@@ -167,10 +170,12 @@ namespace V2SubAuto.Services
                 proc.BeginOutputReadLine();
                 proc.BeginErrorReadLine();
 
-                // Fast readiness polling (15ms loop, scaled deadline for large batches, immediate return when ready)
+                // Fast readiness polling (15ms loop, scaled deadline for large batches, probing both first and last inbounds)
                 int startupBudgetMs = Math.Clamp(2500 + nodeCount * 8, 2500, 6000);
                 var deadline = Stopwatch.StartNew();
-                bool portReady = false;
+                bool firstReady = firstProbePort <= 0 || firstProbePort == probePort;
+                bool lastReady = probePort <= 0;
+
                 while (deadline.ElapsedMilliseconds < startupBudgetMs)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -184,9 +189,23 @@ namespace V2SubAuto.Services
                         return (null, err);
                     }
 
-                    if (probePort > 0 && await IsLocalPortListeningAsync(probePort, ct).ConfigureAwait(false))
+                    if (!firstReady && await IsLocalPortListeningAsync(firstProbePort, ct).ConfigureAwait(false))
                     {
-                        portReady = true;
+                        firstReady = true;
+                    }
+
+                    if (!lastReady && await IsLocalPortListeningAsync(probePort, ct).ConfigureAwait(false))
+                    {
+                        lastReady = true;
+                    }
+
+                    if (firstReady && lastReady)
+                    {
+                        // Brief settle window for large multi-inbound batches where inbounds bind concurrently
+                        if (nodeCount > 50)
+                        {
+                            await Task.Delay(40, ct).ConfigureAwait(false);
+                        }
                         break;
                     }
 
@@ -202,9 +221,9 @@ namespace V2SubAuto.Services
                     return (null, err);
                 }
 
-                if (!portReady && probePort > 0)
+                if ((!firstReady || !lastReady) && probePort > 0)
                 {
-                    try { proc.Kill(entireProcessTree: true); } catch { }
+                    KillAndWait(proc);
                     var err = await CaptureExitErrorAsync(proc, stdoutDone.Task, stderrDone.Task, outputLock, () => fatalLine, () => lastNonWarningLine).ConfigureAwait(false);
                     proc.Dispose();
                     TryDelete(configPath);
@@ -216,20 +235,34 @@ namespace V2SubAuto.Services
             }
             catch (OperationCanceledException)
             {
-                try { if (proc != null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                KillAndWait(proc);
                 try { proc?.Dispose(); } catch { }
-                TryDelete(configPath);
+                if (configPath != null) TryDelete(configPath);
                 PortAllocator.ReleasePorts(leasedPorts);
                 throw;
             }
             catch (Exception ex)
             {
-                try { if (proc != null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                KillAndWait(proc);
                 try { proc?.Dispose(); } catch { }
-                TryDelete(configPath);
+                if (configPath != null) TryDelete(configPath);
                 PortAllocator.ReleasePorts(leasedPorts);
                 return (null, ex.Message);
             }
+        }
+
+        private static void KillAndWait(Process? proc)
+        {
+            if (proc == null) return;
+            try
+            {
+                if (!proc.HasExited)
+                {
+                    proc.Kill(entireProcessTree: true);
+                    proc.WaitForExit(1000);
+                }
+            }
+            catch { }
         }
 
         private static async Task<string> CaptureExitErrorAsync(

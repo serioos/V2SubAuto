@@ -170,9 +170,9 @@
                                 <DataGridTextColumn Header="Protocol" Binding="{Binding ProtocolLabel}" Width="95"/>
                                 <DataGridTextColumn Header="Remarks" Binding="{Binding Remarks}" Width="*"/>
                                 <DataGridTextColumn Header="Server" Binding="{Binding EndpointDisplay}" Width="190"/>
-                                <DataGridTextColumn Header="Tcping" Binding="{Binding TcpingDisplay}" Width="85"/>
-                                <DataGridTextColumn Header="Real Delay" Binding="{Binding RealDelayDisplay}" Width="95"/>
-                                <DataGridTextColumn Header="Speed" Binding="{Binding SpeedDisplay}" Width="95"/>
+                                <DataGridTextColumn Header="Tcping" Binding="{Binding TcpingDisplay}" SortMemberPath="TcpingMs" Width="85"/>
+                                <DataGridTextColumn Header="Real Delay" Binding="{Binding RealDelayDisplay}" SortMemberPath="RealDelayMs" Width="95"/>
+                                <DataGridTextColumn Header="Speed" Binding="{Binding SpeedDisplay}" SortMemberPath="DownloadSpeedMBps" Width="95"/>
                                 <DataGridTextColumn Header="Source" Binding="{Binding SourceName}" Width="150"/>
                             </DataGrid.Columns>
                         </DataGrid>
@@ -339,7 +339,7 @@
                                             <ColumnDefinition Width="*"/>
                                         </Grid.ColumnDefinitions>
                                         <StackPanel Grid.Column="0">
-                                            <TextBlock Text="Real Delay Batch" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,4"/>
+                                            <TextBlock Text="Real Delay Batch (1-250)" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,4"/>
                                             <TextBox x:Name="TxtRealPingBatch"/>
                                         </StackPanel>
                                         <StackPanel Grid.Column="2">
@@ -361,16 +361,22 @@
                                     <Grid Margin="0,10,0,0">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
-                                            <ColumnDefinition Width="12"/>
+                                            <ColumnDefinition Width="10"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="10"/>
                                             <ColumnDefinition Width="*"/>
                                         </Grid.ColumnDefinitions>
                                         <StackPanel Grid.Column="0">
-                                            <TextBlock Text="Speedtest Timeout (sec)" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,4"/>
+                                            <TextBlock Text="Speedtest Timeout (s)" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,4"/>
                                             <TextBox x:Name="TxtSpeedTimeout"/>
                                         </StackPanel>
                                         <StackPanel Grid.Column="2">
-                                            <TextBlock Text="Min Download Speed (MB/s)" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,4"/>
+                                            <TextBlock Text="Min Speed (MB/s)" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,4"/>
                                             <TextBox x:Name="TxtMinSpeed"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="4">
+                                            <TextBlock Text="Batch Delay (s)" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,4" ToolTip="Optional pause in seconds between Tcping/Real Delay batches (0 = no pause)."/>
+                                            <TextBox x:Name="TxtBatchDelay"/>
                                         </StackPanel>
                                     </Grid>
 

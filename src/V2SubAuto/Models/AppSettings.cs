@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
 using System.Runtime.CompilerServices;
 
 namespace V2SubAuto.Models
@@ -52,6 +53,13 @@ namespace V2SubAuto.Models
             }
         }
 
+        public SubscriptionSource Clone() => new()
+        {
+            Name = _name,
+            Url = _url,
+            Enabled = _enabled
+        };
+
         public event PropertyChangedEventHandler? PropertyChanged;
 
         private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
@@ -66,6 +74,8 @@ namespace V2SubAuto.Models
 
     public sealed class AppSettings
     {
+        public const int MaxRealPingBatchSize = 250;
+
         // Startup & Tray
         public bool AutoStartWithWindows { get; set; } = true;
         public bool StartMinimizedToTray { get; set; } = true;
@@ -101,7 +111,7 @@ namespace V2SubAuto.Models
         // Tcping & Real Delay (tuned for fast batch throughput)
         public int TcpingBatchSize { get; set; } = 1000;
         public int TcpingTimeoutSeconds { get; set; } = 4;
-        public int RealPingBatchSize { get; set; } = 500;
+        public int RealPingBatchSize { get; set; } = 250;
         public int RealPingTimeoutSeconds { get; set; } = 4;
         public int BatchDelayIntervalSeconds { get; set; } = 0;
         public string RealPingTestUrl { get; set; } = "https://www.google.com/generate_204";
@@ -122,6 +132,39 @@ namespace V2SubAuto.Models
         // Core Paths (relative to app directory or absolute)
         public string XrayExecutablePath { get; set; } = @"bin\xray\xray.exe";
         public string SingboxExecutablePath { get; set; } = @"bin\sing_box\sing-box.exe";
+
+        public AppSettings Clone() => new()
+        {
+            AutoStartWithWindows = AutoStartWithWindows,
+            StartMinimizedToTray = StartMinimizedToTray,
+            RunImmediatelyOnStartup = RunImmediatelyOnStartup,
+            AutoScheduleEnabled = AutoScheduleEnabled,
+            RefreshIntervalMinutes = RefreshIntervalMinutes,
+            Subscriptions = (Subscriptions ?? new List<SubscriptionSource>()).Select(s => s.Clone()).ToList(),
+            EnableDeduplication = EnableDeduplication,
+            EnableTcpingTest = EnableTcpingTest,
+            EnableRealDelayTest = EnableRealDelayTest,
+            EnableSpeedTest = EnableSpeedTest,
+            KeepOlderDedupl = KeepOlderDedupl,
+            AllowInsecureAndUnencrypted = AllowInsecureAndUnencrypted,
+            TcpingBatchSize = TcpingBatchSize,
+            TcpingTimeoutSeconds = TcpingTimeoutSeconds,
+            RealPingBatchSize = RealPingBatchSize,
+            RealPingTimeoutSeconds = RealPingTimeoutSeconds,
+            BatchDelayIntervalSeconds = BatchDelayIntervalSeconds,
+            RealPingTestUrl = RealPingTestUrl,
+            MixedConcurrencyCount = MixedConcurrencyCount,
+            SpeedTestUrl = SpeedTestUrl,
+            SpeedTestTimeoutSeconds = SpeedTestTimeoutSeconds,
+            MinDownloadSpeedMBps = MinDownloadSpeedMBps,
+            LocalServerPort = LocalServerPort,
+            AllowLanAccess = AllowLanAccess,
+            AppendMetricsToRemarks = AppendMetricsToRemarks,
+            OutputSortMode = OutputSortMode,
+            MaxOutputConfigs = MaxOutputConfigs,
+            XrayExecutablePath = XrayExecutablePath,
+            SingboxExecutablePath = SingboxExecutablePath
+        };
 
         public static readonly string[] PresetPingUrls =
         {

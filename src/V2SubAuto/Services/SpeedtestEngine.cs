@@ -23,6 +23,7 @@ namespace V2SubAuto.Services
     public sealed partial class SpeedtestEngine
     {
         private const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+        private const int MaxGlobalRealPingConcurrency = 250;
         private static readonly TimeSpan ReadStallTimeout = TimeSpan.FromSeconds(3);
         private readonly CoreProcessRunner _runner;
         private readonly SettingsService _settingsService;
@@ -52,9 +53,9 @@ namespace V2SubAuto.Services
             var timeout = TimeSpan.FromSeconds(Math.Max(1, settings.TcpingTimeoutSeconds));
             var delayInterval = TimeSpan.FromSeconds(Math.Max(0, settings.BatchDelayIntervalSeconds));
 
-            // Per-run DNS & (Host, Port) latency caches eliminate redundant probes on shared CDNs
-            var dnsCache = new ConcurrentDictionary<string, Task<IPAddress[]>>(StringComparer.OrdinalIgnoreCase);
-            var endpointCache = new ConcurrentDictionary<(string Host, int Port), Task<int>>();
+            // Lazy<Task<T>> ensures only a single probe/DNS lookup executes per unique key on concurrent cache misses
+            var dnsCache = new ConcurrentDictionary<string, Lazy<Task<IPAddress[]>>>(StringComparer.OrdinalIgnoreCase);
+            var endpointCache = new ConcurrentDictionary<(string Host, int Port), Lazy<Task<int>>>();
 
             foreach (var batch in Chunk(nodes, batchSize))
             {
@@ -66,12 +67,16 @@ namespace V2SubAuto.Services
                     CancellationToken = ct
                 };
 
-                await Parallel.ForEachAsync(batch, parallelOpts, async (node, innerCt) =>
+                await Parallel.ForEachAsync(batch, parallelOpts, async (node, _) =>
                 {
                     var key = (Host: (node.Address ?? string.Empty).Trim().ToLowerInvariant(), node.Port);
-                    node.TcpingMs = await endpointCache.GetOrAdd(
+                    var lazy = endpointCache.GetOrAdd(
                         key,
-                        k => GetTcpingTimeAsync(k.Host, k.Port, timeout, dnsCache, innerCt)).ConfigureAwait(false);
+                        k => new Lazy<Task<int>>(
+                            () => GetTcpingTimeAsync(k.Host, k.Port, timeout, dnsCache, ct),
+                            LazyThreadSafetyMode.ExecutionAndPublication));
+
+                    node.TcpingMs = await lazy.Value.ConfigureAwait(false);
 
                     var done = Interlocked.Increment(ref completed);
                     if (done % 50 == 0 || done == nodes.Count)
@@ -91,7 +96,7 @@ namespace V2SubAuto.Services
             string host,
             int port,
             TimeSpan timeout,
-            ConcurrentDictionary<string, Task<IPAddress[]>> dnsCache,
+            ConcurrentDictionary<string, Lazy<Task<IPAddress[]>>> dnsCache,
             CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(host) || port <= 0)
@@ -110,10 +115,22 @@ namespace V2SubAuto.Services
                 }
                 else
                 {
-                    candidates = await dnsCache.GetOrAdd(
+                    var dnsLazy = dnsCache.GetOrAdd(
                         host,
-                        h => ResolveHostAddressesAsync(h, timeout, ct)).ConfigureAwait(false);
-                    if (candidates.Length == 0) return -1;
+                        h => new Lazy<Task<IPAddress[]>>(
+                            () => ResolveHostAddressesAsync(h, timeout, ct),
+                            LazyThreadSafetyMode.ExecutionAndPublication));
+
+                    candidates = await dnsLazy.Value.ConfigureAwait(false);
+                    if (candidates.Length == 0)
+                    {
+                        // Evict transient empty DNS results so later nodes on the same domain can retry
+                        if (!ct.IsCancellationRequested)
+                        {
+                            dnsCache.TryRemove(new KeyValuePair<string, Lazy<Task<IPAddress[]>>>(host, dnsLazy));
+                        }
+                        return -1;
+                    }
                 }
 
                 // Prefer IPv4 first; fall back to IPv6 only if no IPv4 exists or IPv4 fails
@@ -193,7 +210,7 @@ namespace V2SubAuto.Services
 
             int completed = 0;
             int total = nodes.Count;
-            int pageSize = Math.Max(1, settings.RealPingBatchSize);
+            int pageSize = Math.Clamp(settings.RealPingBatchSize, 1, AppSettings.MaxRealPingBatchSize);
 
             void MarkOneCompleted()
             {
@@ -205,6 +222,7 @@ namespace V2SubAuto.Services
             var xrayNodes = nodes.Where(n => CoreConfigGenerator.ResolveCoreEngine(n, allowInsecure) == CoreEngineType.Xray).ToList();
             var singboxNodes = nodes.Where(n => CoreConfigGenerator.ResolveCoreEngine(n, allowInsecure) == CoreEngineType.SingBox).ToList();
 
+            using var globalProbeGate = new SemaphoreSlim(MaxGlobalRealPingConcurrency, MaxGlobalRealPingConcurrency);
             var tasks = new List<Task>(2);
 
             if (xrayNodes.Count > 0)
@@ -215,6 +233,7 @@ namespace V2SubAuto.Services
                     xrayNodes,
                     pageSize,
                     settings,
+                    globalProbeGate,
                     MarkOneCompleted,
                     log,
                     ct));
@@ -228,6 +247,7 @@ namespace V2SubAuto.Services
                     singboxNodes,
                     pageSize,
                     settings,
+                    globalProbeGate,
                     MarkOneCompleted,
                     log,
                     ct));
@@ -243,6 +263,7 @@ namespace V2SubAuto.Services
             List<ProxyNode> groupNodes,
             int pageSize,
             AppSettings settings,
+            SemaphoreSlim globalProbeGate,
             Action markOneCompleted,
             Action<string> log,
             CancellationToken ct)
@@ -262,8 +283,7 @@ namespace V2SubAuto.Services
             var delayInterval = TimeSpan.FromSeconds(Math.Max(0, settings.BatchDelayIntervalSeconds));
             var pingTimeout = TimeSpan.FromSeconds(Math.Max(2, settings.RealPingTimeoutSeconds));
 
-            // Use 200-250 node chunks with up to 3 concurrent cores for faster core startup on large lists
-            int effectiveBatchSize = groupNodes.Count > 250 && pageSize > 250 ? 250 : pageSize;
+            int effectiveBatchSize = Math.Clamp(pageSize, 1, AppSettings.MaxRealPingBatchSize);
             var batches = Chunk(groupNodes, effectiveBatchSize).ToList();
             var batchLock = new object();
 
@@ -296,9 +316,18 @@ namespace V2SubAuto.Services
                             var firstLine = err.Split('\n')[0].Trim();
                             log($"{coreType} batch ({testable.Count} nodes) failed to start: {firstLine}");
                         }
-                        lock (batchLock)
+
+                        if (testable.Count == 1)
                         {
-                            failedBatches.AddRange(testable);
+                            testable[0].RealDelayMs = -1;
+                            markOneCompleted();
+                        }
+                        else
+                        {
+                            lock (batchLock)
+                            {
+                                failedBatches.AddRange(testable);
+                            }
                         }
                     }
                     return;
@@ -308,17 +337,25 @@ namespace V2SubAuto.Services
                 {
                     var parallelOpts = new ParallelOptions
                     {
-                        MaxDegreeOfParallelism = Math.Min(testable.Count, 500),
+                        MaxDegreeOfParallelism = Math.Min(testable.Count, MaxGlobalRealPingConcurrency),
                         CancellationToken = outerCt
                     };
 
                     await Parallel.ForEachAsync(testable, parallelOpts, async (node, innerCt) =>
                     {
-                        node.RealDelayMs = await GetRealPingTimeAsync(
-                            node.LocalTestPort,
-                            settings.RealPingTestUrl,
-                            pingTimeout,
-                            innerCt).ConfigureAwait(false);
+                        await globalProbeGate.WaitAsync(innerCt).ConfigureAwait(false);
+                        try
+                        {
+                            node.RealDelayMs = await GetRealPingTimeAsync(
+                                node.LocalTestPort,
+                                settings.RealPingTestUrl,
+                                pingTimeout,
+                                innerCt).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            globalProbeGate.Release();
+                        }
                         markOneCompleted();
                     }).ConfigureAwait(false);
                 }
@@ -332,11 +369,11 @@ namespace V2SubAuto.Services
             // V2RayN batch-halving retry when a multi-inbound core fails to start
             if (failedBatches.Count > 0)
             {
-                var nextSize = effectiveBatchSize / 2;
+                var nextSize = Math.Min(effectiveBatchSize, failedBatches.Count) / 2;
                 if (nextSize >= 1)
                 {
                     log($"Retesting {failedBatches.Count} {coreType} configs in smaller batches of {nextSize}...");
-                    await RunRealPingCoreGroupAsync(coreType, exePath, failedBatches, nextSize, settings, markOneCompleted, log, ct).ConfigureAwait(false);
+                    await RunRealPingCoreGroupAsync(coreType, exePath, failedBatches, nextSize, settings, globalProbeGate, markOneCompleted, log, ct).ConfigureAwait(false);
                 }
                 else
                 {
@@ -350,8 +387,8 @@ namespace V2SubAuto.Services
         }
 
         // =====================================================================
-        // Step 4: Batched Speedtest (one persistent core per engine batch,
-        // skips duplicate Real Delay when already measured, supports early stop)
+        // Step 4: Batched Speedtest (concurrent Xray & sing-box engines sharing
+        // a global concurrency semaphore, reusing Real Delay & HttpClient per port)
         // =====================================================================
         public async Task RunMixedSpeedtestAsync(
             List<ProxyNode> nodes,
@@ -390,6 +427,8 @@ namespace V2SubAuto.Services
 
             var xrayNodes = ordered.Where(n => CoreConfigGenerator.ResolveCoreEngine(n, allowInsecure) == CoreEngineType.Xray).ToList();
             var singboxNodes = ordered.Where(n => CoreConfigGenerator.ResolveCoreEngine(n, allowInsecure) == CoreEngineType.SingBox).ToList();
+
+            using var sharedConcurrencyGate = new SemaphoreSlim(concurrency, concurrency);
 
             async Task RunEngineSpeedtestAsync(CoreEngineType coreType, string exePath, List<ProxyNode> groupNodes, int maxBatchSize)
             {
@@ -436,7 +475,18 @@ namespace V2SubAuto.Services
                                 var firstLine = err.Split('\n')[0].Trim();
                                 log($"{coreType} speedtest batch ({testable.Count} nodes) failed to start: {firstLine}");
                             }
-                            failedBatches.AddRange(testable);
+
+                            if (testable.Count == 1)
+                            {
+                                testable[0].RealDelayMs = -1;
+                                testable[0].DownloadSpeedMBps = 0;
+                                var done = Interlocked.Increment(ref completed);
+                                onNodeTested(done, ordered.Count, testable[0]);
+                            }
+                            else
+                            {
+                                failedBatches.AddRange(testable);
+                            }
                         }
                         continue;
                     }
@@ -453,40 +503,51 @@ namespace V2SubAuto.Services
                         {
                             await Parallel.ForEachAsync(testable, parallelOpts, async (node, innerCt) =>
                             {
-                                // Skip duplicate Real Delay ping if Step 3 already measured a valid delay
-                                int delay = settings.EnableRealDelayTest && node.RealDelayMs > 0
-                                    ? node.RealDelayMs
-                                    : await GetRealPingTimeAsync(node.LocalTestPort, settings.RealPingTestUrl, pingTimeout, innerCt).ConfigureAwait(false);
-
-                                node.RealDelayMs = delay;
-
-                                if (delay > 0)
+                                await sharedConcurrencyGate.WaitAsync(innerCt).ConfigureAwait(false);
+                                try
                                 {
-                                    node.DownloadSpeedMBps = await MeasureDownloadSpeedMBpsAsync(
-                                        node.LocalTestPort,
-                                        settings.SpeedTestUrl,
-                                        speedTimeout,
-                                        LogFirstSpeedError,
-                                        innerCt).ConfigureAwait(false);
-                                }
-                                else
-                                {
-                                    node.DownloadSpeedMBps = 0;
-                                }
+                                    // Reuse a single HttpClient/handler per node port across Real Delay (if needed) and Speedtest
+                                    using var handler = CreateProxyHandler(node.LocalTestPort, TimeSpan.FromSeconds(Math.Max(4, pingTimeout.TotalSeconds)));
+                                    using var client = CreateProxyClient(handler);
 
-                                var done = Interlocked.Increment(ref completed);
-                                onNodeTested(done, ordered.Count, node);
+                                    // Skip duplicate Real Delay ping if Step 3 already measured a valid delay
+                                    int delay = settings.EnableRealDelayTest && node.RealDelayMs > 0
+                                        ? node.RealDelayMs
+                                        : await GetRealPingTimeWithClientAsync(client, settings.RealPingTestUrl, pingTimeout, innerCt).ConfigureAwait(false);
 
-                                if (allowEarlyStop &&
-                                    node.RealDelayMs > 0 &&
-                                    node.DownloadSpeedMBps > 0 &&
-                                    node.DownloadSpeedMBps >= settings.MinDownloadSpeedMBps)
-                                {
-                                    if (Interlocked.Increment(ref fastFound) >= settings.MaxOutputConfigs)
+                                    node.RealDelayMs = delay;
+
+                                    if (delay > 0)
                                     {
-                                        log($"Early stop: reached {settings.MaxOutputConfigs} qualifying fast configs.");
-                                        try { earlyStopCts.Cancel(); } catch { }
+                                        node.DownloadSpeedMBps = await MeasureDownloadSpeedMBpsAsync(
+                                            client,
+                                            settings.SpeedTestUrl,
+                                            speedTimeout,
+                                            LogFirstSpeedError,
+                                            innerCt).ConfigureAwait(false);
                                     }
+                                    else
+                                    {
+                                        node.DownloadSpeedMBps = 0;
+                                    }
+
+                                    var done = Interlocked.Increment(ref completed);
+                                    onNodeTested(done, ordered.Count, node);
+
+                                    if (allowEarlyStop &&
+                                        node.RealDelayMs > 0 &&
+                                        (settings.MinDownloadSpeedMBps <= 0 || node.DownloadSpeedMBps >= settings.MinDownloadSpeedMBps))
+                                    {
+                                        if (Interlocked.Increment(ref fastFound) >= settings.MaxOutputConfigs)
+                                        {
+                                            log($"Early stop: reached {settings.MaxOutputConfigs} qualifying fast configs.");
+                                            try { earlyStopCts.Cancel(); } catch { }
+                                        }
+                                    }
+                                }
+                                finally
+                                {
+                                    sharedConcurrencyGate.Release();
                                 }
                             }).ConfigureAwait(false);
                         }
@@ -500,7 +561,7 @@ namespace V2SubAuto.Services
 
                 if (failedBatches.Count > 0 && !activeCt.IsCancellationRequested)
                 {
-                    int nextSize = maxBatchSize / 2;
+                    int nextSize = Math.Min(maxBatchSize, failedBatches.Count) / 2;
                     if (nextSize >= 1)
                     {
                         log($"Retesting {failedBatches.Count} {coreType} speedtest configs in smaller batches of {nextSize}...");
@@ -519,15 +580,17 @@ namespace V2SubAuto.Services
                 }
             }
 
-            // Launch one persistent batched core per engine (cap at 250 nodes/core for fast startup)
-            int initialBatchSize = Math.Min(Math.Max(1, settings.RealPingBatchSize), 250);
+            // Launch Xray and sing-box speedtest engines concurrently so fast sing-box nodes aren't starved
+            int initialBatchSize = Math.Clamp(settings.RealPingBatchSize, 1, AppSettings.MaxRealPingBatchSize);
+            var engineTasks = new List<Task>(2);
+            if (xrayNodes.Count > 0)
+                engineTasks.Add(RunEngineSpeedtestAsync(CoreEngineType.Xray, xrayPath, xrayNodes, initialBatchSize));
+            if (singboxNodes.Count > 0)
+                engineTasks.Add(RunEngineSpeedtestAsync(CoreEngineType.SingBox, singboxPath, singboxNodes, initialBatchSize));
+
             try
             {
-                await RunEngineSpeedtestAsync(CoreEngineType.Xray, xrayPath, xrayNodes, initialBatchSize).ConfigureAwait(false);
-                if (!activeCt.IsCancellationRequested)
-                {
-                    await RunEngineSpeedtestAsync(CoreEngineType.SingBox, singboxPath, singboxNodes, initialBatchSize).ConfigureAwait(false);
-                }
+                await Task.WhenAll(engineTasks).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested && earlyStopCts.IsCancellationRequested)
             {
@@ -544,12 +607,17 @@ namespace V2SubAuto.Services
             CancellationToken ct)
         {
             var json = coreType == CoreEngineType.Xray
-                ? CoreConfigGenerator.GenerateXraySpeedtestConfig(batch, allowInsecureAndUnencrypted, out var testable, out var initialLeasedPorts)
-                : CoreConfigGenerator.GenerateSingboxSpeedtestConfig(batch, allowInsecureAndUnencrypted, out testable, out initialLeasedPorts);
+                ? CoreConfigGenerator.GenerateXraySpeedtestConfig(batch, allowInsecureAndUnencrypted, out var testable, out var initialLeasedPorts, out var portAllocFailed)
+                : CoreConfigGenerator.GenerateSingboxSpeedtestConfig(batch, allowInsecureAndUnencrypted, out testable, out initialLeasedPorts, out portAllocFailed);
 
             if (string.IsNullOrEmpty(json) || testable.Count == 0)
             {
                 PortAllocator.ReleasePorts(initialLeasedPorts);
+                if (portAllocFailed)
+                {
+                    // Port exhaustion is transient — return batch intact so caller can retry in smaller chunks
+                    return (null, new List<ProxyNode>(batch), "Port allocation failed; retrying in smaller batches.");
+                }
                 foreach (var n in batch) onNodeDropped(n);
                 return (null, new List<ProxyNode>(), null);
             }
@@ -581,25 +649,35 @@ namespace V2SubAuto.Services
                 else
                 {
                     currentJson = coreType == CoreEngineType.Xray
-                        ? CoreConfigGenerator.GenerateXraySpeedtestConfig(activeBatch, allowInsecureAndUnencrypted, out activeBatch, out currentLeasedPorts)
-                        : CoreConfigGenerator.GenerateSingboxSpeedtestConfig(activeBatch, allowInsecureAndUnencrypted, out activeBatch, out currentLeasedPorts);
+                        ? CoreConfigGenerator.GenerateXraySpeedtestConfig(activeBatch, allowInsecureAndUnencrypted, out var retryBatch, out var retryPorts, out var retryPortFailed)
+                        : CoreConfigGenerator.GenerateSingboxSpeedtestConfig(activeBatch, allowInsecureAndUnencrypted, out retryBatch, out retryPorts, out retryPortFailed);
+
+                    if (string.IsNullOrEmpty(currentJson) || retryBatch.Count == 0)
+                    {
+                        PortAllocator.ReleasePorts(retryPorts);
+                        if (retryPortFailed)
+                        {
+                            err = "Port allocation failed during retry; falling back to smaller batches.";
+                        }
+                        // Preserve activeBatch so caller retries remaining nodes instead of silently dropping them
+                        break;
+                    }
+
+                    activeBatch = retryBatch;
+                    currentLeasedPorts = retryPorts;
                 }
 
-                if (string.IsNullOrEmpty(currentJson) || activeBatch.Count == 0)
-                {
-                    PortAllocator.ReleasePorts(currentLeasedPorts);
-                    break;
-                }
-
-                var probePort = activeBatch[^1].LocalTestPort;
+                var firstProbePort = activeBatch[0].LocalTestPort;
+                var lastProbePort = activeBatch[^1].LocalTestPort;
                 (proc, err) = await _runner.StartCoreAsync(
                     coreType,
                     exePath,
                     currentJson,
-                    probePort,
+                    lastProbePort,
                     ct,
                     currentLeasedPorts,
-                    activeBatch.Count).ConfigureAwait(false);
+                    activeBatch.Count,
+                    firstProbePort).ConfigureAwait(false);
 
                 if (proc != null)
                     break;
@@ -632,15 +710,15 @@ namespace V2SubAuto.Services
         /// </summary>
         private static async Task<int> GetRealPingTimeAsync(int localPort, string testUrl, TimeSpan timeout, CancellationToken ct)
         {
+            using var handler = CreateProxyHandler(localPort, timeout);
+            using var client = CreateProxyClient(handler);
+            return await GetRealPingTimeWithClientAsync(client, testUrl, timeout, ct).ConfigureAwait(false);
+        }
+
+        private static async Task<int> GetRealPingTimeWithClientAsync(HttpClient client, string testUrl, TimeSpan timeout, CancellationToken ct)
+        {
             try
             {
-                using var handler = CreateProxyHandler(localPort, timeout);
-                using var client = new HttpClient(handler, disposeHandler: false)
-                {
-                    Timeout = Timeout.InfiniteTimeSpan
-                };
-                client.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
-
                 var timings = new List<int>(2);
                 for (int i = 0; i < 2; i++)
                 {
@@ -699,22 +777,22 @@ namespace V2SubAuto.Services
 
         /// <summary>
         /// Streams SpeedTestUrl through local proxy up to SpeedTestTimeout with 3s zero-byte stall abort.
-        /// Stops immediately once connected to a mirror (even if slow), retrying at most 1 fallback mirror if unreachable.
+        /// Stops immediately once connected to a mirror (even if slow), failing over through up to 4 mirrors if unreachable.
         /// </summary>
         private static async Task<double> MeasureDownloadSpeedMBpsAsync(
-            int localPort,
+            HttpClient client,
             string primarySpeedTestUrl,
             TimeSpan timeout,
             Action<string>? onFirstError,
             CancellationToken ct)
         {
-            var urlsToTry = new List<string>(2);
+            var urlsToTry = new List<string>(4);
             if (!string.IsNullOrWhiteSpace(primarySpeedTestUrl))
                 urlsToTry.Add(primarySpeedTestUrl.Trim());
 
             foreach (var mirror in FallbackSpeedMirrors)
             {
-                if (urlsToTry.Count >= 2) break;
+                if (urlsToTry.Count >= 4) break;
                 if (!urlsToTry.Any(u => string.Equals(u, mirror, StringComparison.OrdinalIgnoreCase)))
                     urlsToTry.Add(mirror);
             }
@@ -722,7 +800,7 @@ namespace V2SubAuto.Services
             foreach (var speedTestUrl in urlsToTry)
             {
                 ct.ThrowIfCancellationRequested();
-                var (connected, speedMBps) = await TrySingleMirrorSpeedAsync(localPort, speedTestUrl, timeout, onFirstError, ct).ConfigureAwait(false);
+                var (connected, speedMBps) = await TrySingleMirrorSpeedAsync(client, speedTestUrl, timeout, onFirstError, ct).ConfigureAwait(false);
                 if (connected)
                     return speedMBps;
             }
@@ -731,7 +809,7 @@ namespace V2SubAuto.Services
         }
 
         private static async Task<(bool Connected, double SpeedMBps)> TrySingleMirrorSpeedAsync(
-            int localPort,
+            HttpClient client,
             string speedTestUrl,
             TimeSpan timeout,
             Action<string>? onFirstError,
@@ -740,18 +818,11 @@ namespace V2SubAuto.Services
             double maxBytesPerSecond = 0;
             long totalBytes = 0;
             bool connected = false;
-            var totalSw = Stopwatch.StartNew();
+            Stopwatch? totalSw = null;
             byte[]? buffer = null;
 
             try
             {
-                using var handler = CreateProxyHandler(localPort, TimeSpan.FromSeconds(4));
-                using var client = new HttpClient(handler, disposeHandler: false)
-                {
-                    Timeout = Timeout.InfiniteTimeSpan
-                };
-                client.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
-
                 // Quick 4s header check so blocked mirrors fail over fast
                 using var headerTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
                 using var headerLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, headerTimeoutCts.Token);
@@ -764,6 +835,7 @@ namespace V2SubAuto.Services
                 }
 
                 connected = true;
+                totalSw = Stopwatch.StartNew();
 
                 using var streamTimeoutCts = new CancellationTokenSource(timeout);
                 using var streamLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, streamTimeoutCts.Token);
@@ -775,13 +847,13 @@ namespace V2SubAuto.Services
                 var windowSw = Stopwatch.StartNew();
                 long windowBytes = 0;
 
+                // Single reusable CTS for 3s zero-byte stall abort (avoids per-64KB CTS allocation churn)
+                using var stallCts = CancellationTokenSource.CreateLinkedTokenSource(streamToken);
+
                 while (true)
                 {
-                    // Enforce 3s zero-byte stall abort per read
-                    using var stallCts = new CancellationTokenSource(ReadStallTimeout);
-                    using var readLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(streamToken, stallCts.Token);
-
-                    int read = await stream.ReadAsync(buffer.AsMemory(0, 65536), readLinkedCts.Token).ConfigureAwait(false);
+                    stallCts.CancelAfter(ReadStallTimeout);
+                    int read = await stream.ReadAsync(buffer.AsMemory(0, 65536), stallCts.Token).ConfigureAwait(false);
                     if (read <= 0) break;
 
                     totalBytes += read;
@@ -806,24 +878,28 @@ namespace V2SubAuto.Services
             {
                 throw;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException)
+            {
+                if (!connected)
+                {
+                    onFirstError?.Invoke($"Speedtest header timeout from {speedTestUrl}");
+                }
+                // Timeout or 3s stall abort reached after partial download — normal for speedtest
+            }
+            catch (Exception ex)
             {
                 onFirstError?.Invoke($"Speedtest mirror error ({speedTestUrl}): {ex.Message}");
             }
-            catch
-            {
-                // Timeout or 3s stall abort reached after partial download — normal for speedtest
-            }
             finally
             {
-                totalSw.Stop();
+                totalSw?.Stop();
                 if (buffer != null)
                 {
                     ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
 
-            if (maxBytesPerSecond <= 0 && totalBytes > 0 && totalSw.Elapsed.TotalSeconds > 0.05)
+            if (maxBytesPerSecond <= 0 && totalBytes > 0 && totalSw != null && totalSw.Elapsed.TotalSeconds > 0.05)
             {
                 maxBytesPerSecond = totalBytes / totalSw.Elapsed.TotalSeconds;
             }
@@ -838,9 +914,20 @@ namespace V2SubAuto.Services
                 Proxy = new WebProxy($"http://127.0.0.1:{localPort}"),
                 UseProxy = true,
                 ConnectTimeout = connectTimeout,
-                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                MaxConnectionsPerServer = 2,
+                PooledConnectionLifetime = TimeSpan.FromSeconds(30),
                 AllowAutoRedirect = true
             };
+        }
+
+        private static HttpClient CreateProxyClient(SocketsHttpHandler handler)
+        {
+            var client = new HttpClient(handler, disposeHandler: false)
+            {
+                Timeout = Timeout.InfiniteTimeSpan
+            };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
+            return client;
         }
 
         private static IEnumerable<List<T>> Chunk<T>(List<T> source, int size)

@@ -13,6 +13,8 @@ namespace V2SubAuto.Services
 
     public static class SubscriptionImportParser
     {
+        private static readonly char[] Separators = { '|', '\t' };
+
         private static readonly Regex ListPrefixRegex = new(
             @"^(?:[-*•]\s+|\d+[.)]\s+)",
             RegexOptions.Compiled);
@@ -81,22 +83,27 @@ namespace V2SubAuto.Services
             url = string.Empty;
             uri = null!;
 
+            // Strip markdown / numbered list prefix first (e.g. "- Name | https://..." or "1. https://...")
+            var cleaned = ListPrefixRegex.Replace(line, string.Empty).Trim();
+            if (string.IsNullOrEmpty(cleaned))
+                return false;
+
             // Direct URL on the line
-            if (TryParseHttpUrl(line, out var directUri))
+            if (TryParseHttpUrl(cleaned, out var directUri))
             {
-                url = line;
+                url = cleaned;
                 uri = directUri;
                 return true;
             }
 
             // Optional "Name | URL" or "Name<TAB>URL" format
-            foreach (var separator in new[] { '|', '\t' })
+            foreach (var separator in Separators)
             {
-                int idx = line.IndexOf(separator);
-                if (idx > 0 && idx < line.Length - 1)
+                int idx = cleaned.IndexOf(separator);
+                if (idx > 0 && idx < cleaned.Length - 1)
                 {
-                    var left = line.Substring(0, idx).Trim();
-                    var right = line.Substring(idx + 1).Trim();
+                    var left = cleaned.Substring(0, idx).Trim();
+                    var right = cleaned.Substring(idx + 1).Trim();
                     if (TryParseHttpUrl(right, out var sepUri))
                     {
                         customName = left;
@@ -107,25 +114,20 @@ namespace V2SubAuto.Services
                 }
             }
 
-            // Markdown / numbered list prefix (e.g. "- https://..." or "1. https://...")
-            var stripped = ListPrefixRegex.Replace(line, string.Empty).Trim();
-            if (stripped.Length != line.Length && TryParseHttpUrl(stripped, out var listUri))
-            {
-                url = stripped;
-                uri = listUri;
-                return true;
-            }
-
             return false;
         }
 
-        private static bool TryParseHttpUrl(string candidate, out Uri uri)
+        public static bool TryParseHttpUrl(string? candidate, out Uri uri)
         {
             uri = null!;
-            if (string.IsNullOrWhiteSpace(candidate) || candidate.Any(char.IsWhiteSpace))
+            if (string.IsNullOrWhiteSpace(candidate))
                 return false;
 
-            if (!Uri.TryCreate(candidate, UriKind.Absolute, out var parsed))
+            var trimmed = candidate.Trim();
+            if (trimmed.Any(char.IsWhiteSpace))
+                return false;
+
+            if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var parsed))
                 return false;
 
             if (!string.Equals(parsed.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
@@ -159,7 +161,7 @@ namespace V2SubAuto.Services
             var host = uri.Host;
             var segments = uri.AbsolutePath
                 .Split('/', StringSplitOptions.RemoveEmptyEntries)
-                .Select(Uri.UnescapeDataString)
+                .Select(s => { try { return Uri.UnescapeDataString(s); } catch { return s; } })
                 .ToArray();
 
             string candidate;

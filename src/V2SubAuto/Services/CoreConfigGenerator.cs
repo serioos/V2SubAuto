@@ -117,6 +117,11 @@ namespace V2SubAuto.Services
             "auto", "packet-up", "stream-up", "stream-one"
         };
 
+        private static readonly HashSet<string> ValidKcpHeaders = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "none", "srtp", "utp", "wechat-video", "dtls", "wireguard"
+        };
+
         /// <summary>
         /// Returns true if the server address is a loopback, private RFC1918, link-local, or local domain.
         /// Xray-core v26.7.11+ only permits unencrypted VLESS/Trojan to private addresses.
@@ -241,7 +246,7 @@ namespace V2SubAuto.Services
         }
 
         /// <summary>
-        /// Cheap structural validation used before Tcping so malformed (or disallowed unencrypted)
+        /// Zero-allocation structural validation used before Tcping so malformed (or disallowed unencrypted)
         /// nodes never waste sockets or crash core batches.
         /// </summary>
         public static bool IsStructurallyValid(ProxyNode n, bool allowInsecureAndUnencrypted = false)
@@ -253,25 +258,95 @@ namespace V2SubAuto.Services
                 return false;
 
             var engine = ResolveCoreEngine(n, allowInsecureAndUnencrypted);
-            return engine == CoreEngineType.Xray
-                ? BuildXrayOutbound(n, "check") != null
-                : (n.Protocol == ProxyProtocol.WireGuard
-                    ? BuildSingboxWireGuardEndpoint(n, "check") != null
-                    : BuildSingboxOutbound(n, "check", allowInsecureAndUnencrypted) != null);
+            if (engine == CoreEngineType.Xray)
+            {
+                switch (n.Protocol)
+                {
+                    case ProxyProtocol.Vmess:
+                    case ProxyProtocol.Vless:
+                        if (!Guid.TryParse(n.Password, out _)) return false;
+                        return IsValidXrayStream(n);
+
+                    case ProxyProtocol.Trojan:
+                        if (string.IsNullOrWhiteSpace(n.Password)) return false;
+                        return IsValidXrayStream(n);
+
+                    case ProxyProtocol.Shadowsocks:
+                        if (string.IsNullOrWhiteSpace(n.SsMethod) || !ValidXraySsMethods.Contains(n.SsMethod))
+                            return false;
+                        if (string.IsNullOrWhiteSpace(n.Password))
+                            return false;
+                        if (n.SsMethod.StartsWith("2022-blake3-", StringComparison.OrdinalIgnoreCase) &&
+                            !IsValidSs2022Password(n.SsMethod, n.Password))
+                            return false;
+                        return true;
+
+                    case ProxyProtocol.Socks:
+                        return true;
+
+                    default:
+                        return false;
+                }
+            }
+            else
+            {
+                switch (n.Protocol)
+                {
+                    case ProxyProtocol.Hysteria2:
+                    case ProxyProtocol.Trojan:
+                        return !string.IsNullOrWhiteSpace(n.Password);
+
+                    case ProxyProtocol.Tuic:
+                        return Guid.TryParse(n.Username, out _);
+
+                    case ProxyProtocol.Vless:
+                    case ProxyProtocol.Vmess:
+                        return Guid.TryParse(n.Password, out _);
+
+                    case ProxyProtocol.WireGuard:
+                        return IsValidWgKey(n.Password) && IsValidWgKey(n.PublicKey);
+
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        private static bool IsValidXrayStream(ProxyNode n)
+        {
+            var net = string.IsNullOrWhiteSpace(n.Network) ? "tcp" : n.Network;
+            if (!ValidXrayNetworks.Contains(net))
+                return false;
+
+            if (string.Equals(n.StreamSecurity, "reality", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!IsValidRealityPublicKey(n.PublicKey))
+                    return false;
+                var shortId = (n.ShortId ?? string.Empty).Trim();
+                if (!IsValidRealityShortId(shortId))
+                    return false;
+            }
+
+            return true;
         }
 
         public static string? GenerateXraySpeedtestConfig(
             IList<ProxyNode> nodes,
             bool allowInsecureAndUnencrypted,
             out List<ProxyNode> testableNodes,
-            out List<int> leasedPorts)
+            out List<int> leasedPorts,
+            out bool portAllocationFailed)
         {
             testableNodes = new List<ProxyNode>();
             leasedPorts = new List<int>();
+            portAllocationFailed = false;
 
             var ports = PortAllocator.AllocatePorts(nodes.Count);
             if (ports.Count < nodes.Count)
+            {
+                portAllocationFailed = true;
                 return null;
+            }
 
             var inbounds = new JsonArray();
             var outbounds = new JsonArray();
@@ -302,6 +377,7 @@ namespace V2SubAuto.Services
                     if (relayAlloc.Count == 0)
                     {
                         unusedPorts.Add(port);
+                        portAllocationFailed = true;
                         continue;
                     }
                     relayPort = relayAlloc[0];
@@ -406,14 +482,19 @@ namespace V2SubAuto.Services
             IList<ProxyNode> nodes,
             bool allowInsecureAndUnencrypted,
             out List<ProxyNode> testableNodes,
-            out List<int> leasedPorts)
+            out List<int> leasedPorts,
+            out bool portAllocationFailed)
         {
             testableNodes = new List<ProxyNode>();
             leasedPorts = new List<int>();
+            portAllocationFailed = false;
 
             var ports = PortAllocator.AllocatePorts(nodes.Count);
             if (ports.Count < nodes.Count)
+            {
+                portAllocationFailed = true;
                 return null;
+            }
 
             var inbounds = new JsonArray();
             var outbounds = new JsonArray();
@@ -837,8 +918,7 @@ namespace V2SubAuto.Services
                 }
                 case "kcp":
                 {
-                    var validKcpHeaders = new[] { "none", "srtp", "utp", "wechat-video", "dtls", "wireguard" };
-                    var hdr = validKcpHeaders.Contains(n.KcpHeaderType, StringComparer.OrdinalIgnoreCase)
+                    var hdr = ValidKcpHeaders.Contains(n.KcpHeaderType)
                         ? n.KcpHeaderType.ToLowerInvariant()
                         : "none";
                     var kcp = new JsonObject
@@ -928,6 +1008,52 @@ namespace V2SubAuto.Services
             return true;
         }
 
+        private static bool IsValidWgKey(string? key)
+        {
+            if (string.IsNullOrWhiteSpace(key)) return false;
+            try
+            {
+                var s = key.Trim().Replace('-', '+').Replace('_', '/');
+                int mod = s.Length % 4;
+                if (mod > 0) s = s.PadRight(s.Length + (4 - mod), '=');
+                return Convert.FromBase64String(s).Length == 32;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryNormalizeCidr(string candidate, out string normalized)
+        {
+            normalized = string.Empty;
+            if (string.IsNullOrWhiteSpace(candidate)) return false;
+
+            var slashIdx = candidate.IndexOf('/');
+            if (slashIdx >= 0)
+            {
+                var ipPart = candidate[..slashIdx].Trim();
+                var prefixPart = candidate[(slashIdx + 1)..].Trim();
+                if (!IPAddress.TryParse(ipPart, out var ip) || !int.TryParse(prefixPart, out var prefix))
+                    return false;
+
+                int maxPrefix = ip.AddressFamily == AddressFamily.InterNetworkV6 ? 128 : 32;
+                if (prefix < 0 || prefix > maxPrefix)
+                    return false;
+
+                normalized = $"{ip}/{prefix}";
+                return true;
+            }
+
+            if (!IPAddress.TryParse(candidate.Trim(), out var parsedIp))
+                return false;
+
+            normalized = parsedIp.AddressFamily == AddressFamily.InterNetworkV6
+                ? $"{parsedIp}/128"
+                : $"{parsedIp}/32";
+            return true;
+        }
+
         private static JsonObject? BuildSingboxOutbound(ProxyNode n, string tag, bool allowInsecureAndUnencrypted)
         {
             if (string.IsNullOrWhiteSpace(n.Address) || n.Port <= 0 || n.Port > 65535)
@@ -987,11 +1113,11 @@ namespace V2SubAuto.Services
                     if (hasTls)
                     {
                         obj["tls"] = BuildSingboxTls(n, allowInsecureAndUnencrypted, forceEnabled: false);
-                        if (!string.IsNullOrEmpty(n.Flow) &&
-                            ValidVlessFlows.Contains(n.Flow) &&
+                        // sing-box only supports xtls-rprx-vision (not xtls-rprx-vision-udp443)
+                        if (string.Equals(n.Flow, "xtls-rprx-vision", StringComparison.OrdinalIgnoreCase) &&
                             string.Equals(n.Network, "tcp", StringComparison.OrdinalIgnoreCase))
                         {
-                            obj["flow"] = n.Flow;
+                            obj["flow"] = "xtls-rprx-vision";
                         }
                     }
                     var transport = BuildSingboxTransport(n);
@@ -1108,14 +1234,17 @@ namespace V2SubAuto.Services
         {
             if (string.IsNullOrWhiteSpace(n.Address) || n.Port <= 0 || n.Port > 65535)
                 return null;
-            if (string.IsNullOrWhiteSpace(n.Password) || string.IsNullOrWhiteSpace(n.PublicKey))
+            if (!IsValidWgKey(n.Password) || !IsValidWgKey(n.PublicKey))
                 return null;
 
             var addrs = new JsonArray();
             var rawAddrs = string.IsNullOrWhiteSpace(n.WgLocalAddress) ? "172.16.0.2/32" : n.WgLocalAddress;
             foreach (var a in rawAddrs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
-                addrs.Add(a.Contains('/') ? a : (a.Contains(':') ? $"{a}/128" : $"{a}/32"));
+                if (TryNormalizeCidr(a, out var cidr))
+                {
+                    addrs.Add(cidr);
+                }
             }
             if (addrs.Count == 0) addrs.Add("172.16.0.2/32");
 
@@ -1176,7 +1305,7 @@ namespace V2SubAuto.Services
 
         private static JsonObject BuildSingboxTls(ProxyNode n, bool allowInsecureAndUnencrypted, bool forceEnabled)
         {
-            bool insecure = allowInsecureAndUnencrypted || (forceEnabled && n.AllowInsecure);
+            bool insecure = allowInsecureAndUnencrypted && n.AllowInsecure;
             var serverName = !string.IsNullOrEmpty(n.Sni)
                 ? n.Sni
                 : (!string.IsNullOrEmpty(n.Host) ? n.Host : n.Address);

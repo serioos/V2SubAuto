@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -12,6 +13,8 @@ namespace V2SubAuto.Services
 {
     public sealed class PipelineOrchestrator : IDisposable
     {
+        private const int MaxSubscriptionBytes = 25 * 1024 * 1024; // 25 MB safety cap
+
         private readonly SettingsService _settingsService;
         private readonly SpeedtestEngine _speedtest;
         private readonly LocalSubscriptionServer _server;
@@ -19,6 +22,7 @@ namespace V2SubAuto.Services
 
         private readonly SemaphoreSlim _runLock = new(1, 1);
         private readonly object _snapshotLock = new();
+        private readonly object _stateLock = new();
         private CancellationTokenSource? _currentRunCts;
         private CancellationTokenSource? _schedulerCts;
         private volatile bool _disposed;
@@ -48,16 +52,28 @@ namespace V2SubAuto.Services
             LocalSubscriptionServer server,
             CoreProcessRunner runner)
         {
-            _settings = settings;
+            _settings = settings.Clone();
             _settingsService = settingsService;
             _speedtest = speedtest;
             _server = server;
             _runner = runner;
         }
 
+        public void InitializeCachedState(int servingCount, DateTime? lastCompletedUtc)
+        {
+            UpdateSnapshot(prev => prev with
+            {
+                FinalSurvivingCount = Math.Max(0, servingCount),
+                LastCompletedUtc = lastCompletedUtc,
+                DetailMessage = servingCount > 0
+                    ? $"Serving {servingCount} cached configs at {_server.SubscriptionUrl}"
+                    : prev.DetailMessage
+            });
+        }
+
         public void UpdateSettings(AppSettings settings)
         {
-            _settings = settings;
+            Volatile.Write(ref _settings, settings.Clone());
             RestartScheduler();
         }
 
@@ -70,24 +86,41 @@ namespace V2SubAuto.Services
         {
             if (_disposed) return;
 
-            try { _schedulerCts?.Cancel(); } catch { }
-            _schedulerCts?.Dispose();
-            _schedulerCts = null;
+            CancellationToken ct;
+            bool autoScheduleEnabled;
 
-            if (!_settings.AutoScheduleEnabled)
+            lock (_stateLock)
+            {
+                if (_disposed) return;
+
+                try { _schedulerCts?.Cancel(); } catch { }
+                try { _schedulerCts?.Dispose(); } catch { }
+                _schedulerCts = null;
+
+                autoScheduleEnabled = Volatile.Read(ref _settings).AutoScheduleEnabled;
+                if (!autoScheduleEnabled)
+                {
+                    ct = CancellationToken.None;
+                }
+                else
+                {
+                    _schedulerCts = new CancellationTokenSource();
+                    ct = _schedulerCts.Token;
+                }
+            }
+
+            if (!autoScheduleEnabled)
             {
                 UpdateSnapshot(s => s with { NextScheduledUtc = null });
                 return;
             }
 
-            _schedulerCts = new CancellationTokenSource();
-            var ct = _schedulerCts.Token;
-
             _ = Task.Run(async () =>
             {
                 while (!ct.IsCancellationRequested && !_disposed)
                 {
-                    var interval = TimeSpan.FromMinutes(Math.Max(1, _settings.RefreshIntervalMinutes));
+                    var currentSettings = Volatile.Read(ref _settings);
+                    var interval = TimeSpan.FromMinutes(Math.Max(1, currentSettings.RefreshIntervalMinutes));
                     UpdateSnapshot(s => s with { NextScheduledUtc = DateTime.UtcNow.Add(interval) });
 
                     try
@@ -99,7 +132,7 @@ namespace V2SubAuto.Services
                         break;
                     }
 
-                    if (!ct.IsCancellationRequested && !_disposed && _settings.AutoScheduleEnabled)
+                    if (!ct.IsCancellationRequested && !_disposed && Volatile.Read(ref _settings).AutoScheduleEnabled)
                     {
                         await RunPipelineAsync().ConfigureAwait(false);
                     }
@@ -109,12 +142,56 @@ namespace V2SubAuto.Services
 
         public void CancelCurrentRun()
         {
+            CancellationTokenSource? ctsToCancel;
+            lock (_stateLock)
+            {
+                ctsToCancel = _currentRunCts;
+            }
+
+            if (ctsToCancel == null)
+                return;
+
             try
             {
-                _currentRunCts?.Cancel();
+                ctsToCancel.Cancel();
                 Log("Cancellation requested by user.");
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Cancels any active pipeline run and acquires the exclusive run lock so core binaries
+        /// can be safely replaced without file-lock races or scheduler interference.
+        /// </summary>
+        public async Task<IDisposable?> TryPauseForCoreUpdateAsync(TimeSpan timeout)
+        {
+            if (_disposed) return null;
+
+            CancelCurrentRun();
+            try
+            {
+                if (await _runLock.WaitAsync(timeout).ConfigureAwait(false))
+                {
+                    return new RunLockReleaser(_runLock);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+
+            return null;
+        }
+
+        private sealed class RunLockReleaser : IDisposable
+        {
+            private SemaphoreSlim? _lock;
+            public RunLockReleaser(SemaphoreSlim runLock) => _lock = runLock;
+            public void Dispose()
+            {
+                var l = Interlocked.Exchange(ref _lock, null);
+                if (l == null) return;
+                try { l.Release(); } catch (ObjectDisposedException) { }
+            }
         }
 
         private static bool IsUdpOnly(ProxyNode n) =>
@@ -141,10 +218,20 @@ namespace V2SubAuto.Services
             }
 
             var runCts = new CancellationTokenSource();
-            _currentRunCts = runCts;
+            lock (_stateLock)
+            {
+                if (_disposed)
+                {
+                    runCts.Dispose();
+                    try { _runLock.Release(); } catch (ObjectDisposedException) { }
+                    return;
+                }
+                _currentRunCts = runCts;
+            }
+
             var ct = runCts.Token;
-            var s = _settings;
-            var subsSnapshot = s.Subscriptions.ToList();
+            var s = Volatile.Read(ref _settings).Clone();
+            var subsSnapshot = s.Subscriptions;
 
             try
             {
@@ -154,6 +241,7 @@ namespace V2SubAuto.Services
                     CurrentStage = "1/7 Fetching Subscriptions",
                     DetailMessage = "Downloading config lists...",
                     ProgressPercent = 2,
+                    FinalSurvivingCount = prev.FinalSurvivingCount,
                     LastCompletedUtc = prev.LastCompletedUtc,
                     NextScheduledUtc = prev.NextScheduledUtc
                 });
@@ -204,7 +292,7 @@ namespace V2SubAuto.Services
                 if (current.Count == 0)
                 {
                     Log("0 structurally valid configs remained. Keeping previous subscription payload.");
-                    CompleteRun("Completed", "0 valid configs remained after pre-filtering.");
+                    CompleteRun("Completed", "0 valid configs remained after pre-filtering (kept previous cache).");
                     return;
                 }
 
@@ -285,16 +373,16 @@ namespace V2SubAuto.Services
                             pct);
                     }, Log, ct).ConfigureAwait(false);
 
-                    UpdateStage("6/7 Filtering & Sorting", $"Filtering configs >= {s.MinDownloadSpeedMBps:0.0} MB/s...", 97);
+                    UpdateStage("6/7 Filtering & Sorting", $"Filtering configs >= {s.MinDownloadSpeedMBps:0.##} MB/s...", 97);
                     int validDelayCount = current.Count(n => n.RealDelayMs > 0);
                     int measuredSpeedCount = current.Count(n => n.DownloadSpeedMBps > 0);
                     double maxSpeed = current.Count > 0 ? current.Max(n => n.DownloadSpeedMBps) : 0;
 
                     surviving = current
-                        .Where(n => n.RealDelayMs > 0 && n.DownloadSpeedMBps > 0 && n.DownloadSpeedMBps >= s.MinDownloadSpeedMBps)
+                        .Where(n => n.RealDelayMs > 0 && (s.MinDownloadSpeedMBps <= 0 || n.DownloadSpeedMBps >= s.MinDownloadSpeedMBps))
                         .ToList();
 
-                    Log($"Speedtest complete: {validDelayCount}/{current.Count} passed delay, {measuredSpeedCount} measured >0 MB/s (max {maxSpeed:0.0} MB/s), {surviving.Count} met >= {s.MinDownloadSpeedMBps:0.0} MB/s.");
+                    Log($"Speedtest complete: {validDelayCount}/{current.Count} passed delay, {measuredSpeedCount} measured >0 MB/s (max {maxSpeed:0.0} MB/s), {surviving.Count} met >= {s.MinDownloadSpeedMBps:0.##} MB/s.");
 
                     surviving = s.OutputSortMode == SortOrderMode.DelayAscending
                         ? surviving.OrderBy(n => n.RealDelayMs).ThenByDescending(n => n.DownloadSpeedMBps).ToList()
@@ -345,9 +433,12 @@ namespace V2SubAuto.Services
             finally
             {
                 _runner.CleanupTempDirectory();
-                if (ReferenceEquals(_currentRunCts, runCts))
+                lock (_stateLock)
                 {
-                    _currentRunCts = null;
+                    if (ReferenceEquals(_currentRunCts, runCts))
+                    {
+                        _currentRunCts = null;
+                    }
                 }
                 runCts.Dispose();
                 try
@@ -415,7 +506,13 @@ namespace V2SubAuto.Services
                                 attemptCts.Token).ConfigureAwait(false);
                             response.EnsureSuccessStatusCode();
 
-                            var text = await response.Content.ReadAsStringAsync(attemptCts.Token).ConfigureAwait(false);
+                            if (response.Content.Headers.ContentLength > MaxSubscriptionBytes)
+                            {
+                                Log($"Skipped {sub.Name}: response size exceeds {MaxSubscriptionBytes / (1024 * 1024)} MB limit.");
+                                return new List<ProxyNode>();
+                            }
+
+                            var text = await ReadContentWithLimitAsync(response.Content, MaxSubscriptionBytes, attemptCts.Token).ConfigureAwait(false);
                             var parsed = NodeParser.ParseSubscriptionContent(text, sub.Name);
                             Log($"Parsed {parsed.Count} configs from {sub.Name}.");
                             return parsed;
@@ -464,6 +561,28 @@ namespace V2SubAuto.Services
             }
 
             return allNodes;
+        }
+
+        private static async Task<string> ReadContentWithLimitAsync(HttpContent content, int maxBytes, CancellationToken ct)
+        {
+            await using var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var ms = new MemoryStream();
+            var buffer = new byte[16384];
+            int total = 0;
+
+            while (true)
+            {
+                int read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (read <= 0) break;
+
+                total += read;
+                if (total > maxBytes)
+                    throw new InvalidOperationException($"Subscription payload exceeded {maxBytes / (1024 * 1024)} MB limit.");
+
+                ms.Write(buffer, 0, read);
+            }
+
+            return Encoding.UTF8.GetString(ms.GetBuffer(), 0, (int)ms.Length);
         }
 
         private static bool IsTransientHttpError(HttpRequestException ex)
@@ -527,25 +646,38 @@ namespace V2SubAuto.Services
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
+            CancellationTokenSource? schedCts;
+            CancellationTokenSource? runCts;
 
-            try { _schedulerCts?.Cancel(); } catch { }
-            try { _currentRunCts?.Cancel(); } catch { }
-            _schedulerCts?.Dispose();
-            _schedulerCts = null;
+            lock (_stateLock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                schedCts = _schedulerCts;
+                runCts = _currentRunCts;
+                _schedulerCts = null;
+            }
 
-            // Wait briefly for any active run to exit before disposing the semaphore
+            try { schedCts?.Cancel(); } catch { }
+            try { runCts?.Cancel(); } catch { }
+            try { schedCts?.Dispose(); } catch { }
+
+            // Wait briefly for any active run to exit; only dispose _runLock if we actually acquired it
+            bool lockAcquired = false;
             try
             {
-                if (_runLock.Wait(500))
+                lockAcquired = _runLock.Wait(500);
+                if (lockAcquired)
                 {
                     _runLock.Release();
                 }
             }
             catch { }
 
-            _runLock.Dispose();
+            if (lockAcquired)
+            {
+                _runLock.Dispose();
+            }
         }
     }
 }

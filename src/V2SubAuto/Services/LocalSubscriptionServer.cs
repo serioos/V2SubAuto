@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -21,6 +22,8 @@ namespace V2SubAuto.Services
     /// </summary>
     public sealed class LocalSubscriptionServer : IDisposable
     {
+        private const int MaxHeaderBytes = 16384;
+
         private static readonly string[] VirtualAdapterKeywords =
         {
             "vethernet", "hyper-v", "virtualbox", "vmware", "wsl", "docker",
@@ -76,12 +79,14 @@ namespace V2SubAuto.Services
             try
             {
                 var bindAddress = allowLan ? IPAddress.Any : IPAddress.Loopback;
-                _listener = new TcpListener(bindAddress, port);
-                _listener.Start();
-                _isRunning = true;
+                var listener = new TcpListener(bindAddress, port);
+                listener.Start();
 
-                _cts = new CancellationTokenSource();
-                _loopTask = Task.Run(() => ListenLoopAsync(_cts.Token));
+                var cts = new CancellationTokenSource();
+                _listener = listener;
+                _cts = cts;
+                _isRunning = true;
+                _loopTask = Task.Run(() => ListenLoopAsync(listener, cts.Token));
 
                 if (allowLan)
                 {
@@ -108,42 +113,45 @@ namespace V2SubAuto.Services
         public void Stop()
         {
             _isRunning = false;
-            try { _cts?.Cancel(); } catch { }
-            try { _listener?.Stop(); } catch { }
-            _listener = null;
-            _cts?.Dispose();
+            var cts = _cts;
+            var listener = _listener;
             _cts = null;
+            _listener = null;
+
+            try { cts?.Cancel(); } catch { }
+            try { listener?.Stop(); } catch { }
+            cts?.Dispose();
         }
 
-        private async Task ListenLoopAsync(CancellationToken ct)
+        private async Task ListenLoopAsync(TcpListener listener, CancellationToken ct)
         {
-            while (!ct.IsCancellationRequested && _listener != null)
+            while (!ct.IsCancellationRequested)
             {
                 TcpClient client;
                 try
                 {
-                    client = await _listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
+                    client = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
                 }
                 catch
                 {
                     break;
                 }
 
-                _ = Task.Run(() => HandleClientAsync(client), ct);
+                // Always start with CancellationToken.None so HandleClientAsync always disposes client
+                _ = Task.Run(() => HandleClientAsync(client, ct), CancellationToken.None);
             }
         }
 
-        private async Task HandleClientAsync(TcpClient client)
+        private async Task HandleClientAsync(TcpClient client, CancellationToken serverCt)
         {
             using (client)
             {
                 try
                 {
-                    client.ReceiveTimeout = 5000;
-                    client.SendTimeout = 10000;
                     await using var stream = client.GetStream();
 
-                    using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(serverCt);
+                    readCts.CancelAfter(TimeSpan.FromSeconds(5));
                     var requestLine = await ReadRequestLineAsync(stream, readCts.Token).ConfigureAwait(false);
                     if (string.IsNullOrWhiteSpace(requestLine))
                         return;
@@ -155,10 +163,23 @@ namespace V2SubAuto.Services
                     var method = parts[0].ToUpperInvariant();
                     var rawTarget = parts[1];
 
-                    // Strip query string if present
-                    var qIdx = rawTarget.IndexOf('?');
-                    var pathPart = qIdx >= 0 ? rawTarget[..qIdx] : rawTarget;
+                    string pathPart;
+                    if ((rawTarget.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                         rawTarget.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) &&
+                        Uri.TryCreate(rawTarget, UriKind.Absolute, out var absUri))
+                    {
+                        pathPart = absUri.AbsolutePath;
+                    }
+                    else
+                    {
+                        var qIdx = rawTarget.IndexOf('?');
+                        pathPart = qIdx >= 0 ? rawTarget[..qIdx] : rawTarget;
+                    }
+
                     var path = pathPart.TrimEnd('/').ToLowerInvariant();
+
+                    using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(serverCt);
+                    writeCts.CancelAfter(TimeSpan.FromSeconds(15));
 
                     if (method == "OPTIONS")
                     {
@@ -168,7 +189,8 @@ namespace V2SubAuto.Services
                             "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n" +
                             "Connection: close\r\n\r\n";
                         var optBytes = Encoding.ASCII.GetBytes(optionsHeader);
-                        await stream.WriteAsync(optBytes, readCts.Token).ConfigureAwait(false);
+                        await stream.WriteAsync(optBytes, writeCts.Token).ConfigureAwait(false);
+                        await stream.FlushAsync(writeCts.Token).ConfigureAwait(false);
                         return;
                     }
 
@@ -180,36 +202,58 @@ namespace V2SubAuto.Services
                             "Content-Length: 0\r\n" +
                             "Connection: close\r\n\r\n";
                         var naBytes = Encoding.ASCII.GetBytes(notAllowed);
-                        await stream.WriteAsync(naBytes, readCts.Token).ConfigureAwait(false);
+                        await stream.WriteAsync(naBytes, writeCts.Token).ConfigureAwait(false);
+                        await stream.FlushAsync(writeCts.Token).ConfigureAwait(false);
                         return;
                     }
 
                     string body;
                     string contentType = "text/plain; charset=utf-8";
 
-                    lock (_lock)
+                    if (path == "/raw")
                     {
-                        if (path == "/raw")
+                        lock (_lock)
                         {
                             body = _rawPayload;
                         }
-                        else if (path == "/status")
+                    }
+                    else if (path == "/status")
+                    {
+                        int count;
+                        DateTime? lastUpdatedUtc;
+                        lock (_lock)
                         {
-                            contentType = "application/json; charset=utf-8";
-                            body = JsonSerializer.Serialize(new
-                            {
-                                count = _configCount,
-                                lastUpdatedUtc = _lastUpdatedUtc,
-                                allowLanAccess = AllowLanAccess,
-                                subscriptionUrl = SubscriptionUrl,
-                                lanSubscriptionUrl = LanSubscriptionUrl
-                            });
+                            count = _configCount;
+                            lastUpdatedUtc = _lastUpdatedUtc;
                         }
-                        else
+
+                        contentType = "application/json; charset=utf-8";
+                        body = JsonSerializer.Serialize(new
                         {
-                            // Default & /sub -> Base64 subscription for V2RayN & mobile clients
+                            count,
+                            lastUpdatedUtc,
+                            allowLanAccess = AllowLanAccess,
+                            subscriptionUrl = SubscriptionUrl,
+                            lanSubscriptionUrl = LanSubscriptionUrl
+                        });
+                    }
+                    else if (path == "" || path == "/sub")
+                    {
+                        lock (_lock)
+                        {
                             body = _base64Payload;
                         }
+                    }
+                    else
+                    {
+                        var notFound =
+                            "HTTP/1.1 404 Not Found\r\n" +
+                            "Content-Length: 0\r\n" +
+                            "Connection: close\r\n\r\n";
+                        var nfBytes = Encoding.ASCII.GetBytes(notFound);
+                        await stream.WriteAsync(nfBytes, writeCts.Token).ConfigureAwait(false);
+                        await stream.FlushAsync(writeCts.Token).ConfigureAwait(false);
+                        return;
                     }
 
                     var bodyBytes = Encoding.UTF8.GetBytes(body);
@@ -223,12 +267,12 @@ namespace V2SubAuto.Services
                         "Connection: close\r\n\r\n";
 
                     var headerBytes = Encoding.ASCII.GetBytes(headerText);
-                    await stream.WriteAsync(headerBytes, readCts.Token).ConfigureAwait(false);
+                    await stream.WriteAsync(headerBytes, writeCts.Token).ConfigureAwait(false);
                     if (method != "HEAD" && bodyBytes.Length > 0)
                     {
-                        await stream.WriteAsync(bodyBytes, readCts.Token).ConfigureAwait(false);
+                        await stream.WriteAsync(bodyBytes, writeCts.Token).ConfigureAwait(false);
                     }
-                    await stream.FlushAsync(readCts.Token).ConfigureAwait(false);
+                    await stream.FlushAsync(writeCts.Token).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -239,29 +283,37 @@ namespace V2SubAuto.Services
 
         private static async Task<string?> ReadRequestLineAsync(NetworkStream stream, CancellationToken ct)
         {
-            var buffer = new byte[4096];
-            int totalRead = 0;
-
-            while (totalRead < buffer.Length)
+            var buffer = ArrayPool<byte>.Shared.Rent(MaxHeaderBytes);
+            try
             {
-                int n = await stream.ReadAsync(buffer.AsMemory(totalRead, buffer.Length - totalRead), ct).ConfigureAwait(false);
-                if (n <= 0) break;
-                totalRead += n;
+                int totalRead = 0;
 
-                // Stop as soon as we see the end of HTTP headers (\r\n\r\n) or at least the request line (\r\n)
-                var text = Encoding.ASCII.GetString(buffer, 0, totalRead);
-                int headerEnd = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-                if (headerEnd >= 0)
+                while (totalRead < MaxHeaderBytes)
                 {
-                    int firstCrLf = text.IndexOf("\r\n", StringComparison.Ordinal);
-                    return firstCrLf >= 0 ? text[..firstCrLf] : text;
-                }
-            }
+                    int n = await stream.ReadAsync(buffer.AsMemory(totalRead, MaxHeaderBytes - totalRead), ct).ConfigureAwait(false);
+                    if (n <= 0) break;
+                    totalRead += n;
 
-            if (totalRead == 0) return null;
-            var fallback = Encoding.ASCII.GetString(buffer, 0, totalRead);
-            int lineEnd = fallback.IndexOf('\n');
-            return (lineEnd >= 0 ? fallback[..lineEnd] : fallback).TrimEnd('\r');
+                    var span = buffer.AsSpan(0, totalRead);
+                    if (span.IndexOf("\r\n\r\n"u8) >= 0)
+                    {
+                        int firstCrLf = span.IndexOf("\r\n"u8);
+                        return firstCrLf >= 0
+                            ? Encoding.ASCII.GetString(span[..firstCrLf])
+                            : Encoding.ASCII.GetString(span);
+                    }
+                }
+
+                if (totalRead == 0) return null;
+                var fullSpan = buffer.AsSpan(0, totalRead);
+                int lineEnd = fullSpan.IndexOf((byte)'\n');
+                var lineSpan = lineEnd >= 0 ? fullSpan[..lineEnd] : fullSpan;
+                return Encoding.ASCII.GetString(lineSpan).TrimEnd('\r');
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
 
         public static string? DetectPreferredLanIpv4()

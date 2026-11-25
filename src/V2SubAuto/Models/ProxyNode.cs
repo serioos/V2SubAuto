@@ -43,6 +43,7 @@ namespace V2SubAuto.Models
         // Protocol extras
         public string VlessEncryption { get; set; } = "none";
         public string SsMethod { get; set; } = string.Empty;
+        public string SsPlugin { get; set; } = string.Empty;
         public string VmessSecurity { get; set; } = "auto";
         public int VmessAlterId { get; set; } = 0;
         public string Flow { get; set; } = string.Empty;
