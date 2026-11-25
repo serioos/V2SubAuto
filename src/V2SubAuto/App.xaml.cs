@@ -257,6 +257,20 @@ namespace V2SubAuto
 
         private static Icon CreateTrayIcon()
         {
+            try
+            {
+                var resourceInfo = GetResourceStream(new Uri("pack://application:,,,/Assets/app.ico"));
+                if (resourceInfo?.Stream != null)
+                {
+                    using var stream = resourceInfo.Stream;
+                    return new Icon(stream, new System.Drawing.Size(32, 32));
+                }
+            }
+            catch
+            {
+                // Fall back to generated vector icon if resource loading fails
+            }
+
             using var bmp = new Bitmap(32, 32);
             using var g = Graphics.FromImage(bmp);
             g.SmoothingMode = SmoothingMode.AntiAlias;

@@ -12,9 +12,14 @@
     <Version>1.0.0</Version>
     <Authors>V2SubAuto</Authors>
     <Description>Lightweight Windows 11 tray automation app replicating V2RayN's subscription, deduplication, Tcping, Real Delay, and Speedtest pipeline.</Description>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <PublishSingleFile>false</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\app.ico" />
+  </ItemGroup>
 
 </Project>
