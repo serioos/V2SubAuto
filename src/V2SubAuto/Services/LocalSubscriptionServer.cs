@@ -294,26 +294,44 @@ namespace V2SubAuto.Services
                     if (n <= 0) break;
                     totalRead += n;
 
-                    var span = buffer.AsSpan(0, totalRead);
-                    if (span.IndexOf("\r\n\r\n"u8) >= 0)
+                    if (TryExtractRequestLine(buffer, totalRead, requireHeaderEnd: true, out var requestLine))
                     {
-                        int firstCrLf = span.IndexOf("\r\n"u8);
-                        return firstCrLf >= 0
-                            ? Encoding.ASCII.GetString(span[..firstCrLf])
-                            : Encoding.ASCII.GetString(span);
+                        return requestLine;
                     }
                 }
 
-                if (totalRead == 0) return null;
-                var fullSpan = buffer.AsSpan(0, totalRead);
-                int lineEnd = fullSpan.IndexOf((byte)'\n');
-                var lineSpan = lineEnd >= 0 ? fullSpan[..lineEnd] : fullSpan;
-                return Encoding.ASCII.GetString(lineSpan).TrimEnd('\r');
+                return TryExtractRequestLine(buffer, totalRead, requireHeaderEnd: false, out var fallbackLine)
+                    ? fallbackLine
+                    : null;
             }
             finally
             {
                 ArrayPool<byte>.Shared.Return(buffer);
             }
+        }
+
+        private static bool TryExtractRequestLine(byte[] buffer, int totalRead, bool requireHeaderEnd, out string? requestLine)
+        {
+            requestLine = null;
+            if (totalRead <= 0) return false;
+
+            var span = buffer.AsSpan(0, totalRead);
+            if (requireHeaderEnd)
+            {
+                if (span.IndexOf("\r\n\r\n"u8) < 0)
+                    return false;
+
+                int firstCrLf = span.IndexOf("\r\n"u8);
+                requestLine = firstCrLf >= 0
+                    ? Encoding.ASCII.GetString(span[..firstCrLf])
+                    : Encoding.ASCII.GetString(span);
+                return true;
+            }
+
+            int lineEnd = span.IndexOf((byte)'\n');
+            var lineSpan = lineEnd >= 0 ? span[..lineEnd] : span;
+            requestLine = Encoding.ASCII.GetString(lineSpan).TrimEnd('\r');
+            return true;
         }
 
         public static string? DetectPreferredLanIpv4()
