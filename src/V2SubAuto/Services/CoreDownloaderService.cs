@@ -19,9 +19,12 @@ namespace V2SubAuto.Services
             string xrayTargetPath,
             string singboxTargetPath,
             Action<string> log,
-            CancellationToken ct)
+            CancellationToken ct,
+            bool useSystemProxy = false)
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(3) };
+            using var handler = new SocketsHttpHandler();
+            DownloadProxyHelper.Configure(handler, useSystemProxy);
+            using var http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(3) };
             http.DefaultRequestHeaders.UserAgent.ParseAdd("V2SubAuto/1.0");
 
             var xrayTask = DownloadCoreAsync(

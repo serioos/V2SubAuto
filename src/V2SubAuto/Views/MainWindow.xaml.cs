@@ -169,6 +169,7 @@ namespace V2SubAuto.Views
             ChkStepSpeedTest.IsChecked = _settings.EnableSpeedTest;
 
             ChkKeepOlderDedup.IsChecked = _settings.KeepOlderDedupl;
+            ChkUseSystemProxy.IsChecked = _settings.UseSystemProxyForDownloads;
             ChkAllowInsecure.IsChecked = _settings.AllowInsecureAndUnencrypted;
             TxtTcpingBatch.Text = _settings.TcpingBatchSize.ToString(CultureInfo.InvariantCulture);
             TxtTcpingTimeout.Text = _settings.TcpingTimeoutSeconds.ToString(CultureInfo.InvariantCulture);
@@ -663,6 +664,7 @@ namespace V2SubAuto.Views
                 _settings.EnableSpeedTest = ChkStepSpeedTest.IsChecked == true;
 
                 _settings.KeepOlderDedupl = ChkKeepOlderDedup.IsChecked == true;
+                _settings.UseSystemProxyForDownloads = ChkUseSystemProxy.IsChecked == true;
                 _settings.AllowInsecureAndUnencrypted = ChkAllowInsecure.IsChecked == true;
                 _settings.TcpingBatchSize = tcpBatch;
                 _settings.TcpingTimeoutSeconds = tcpTimeout;
@@ -756,7 +758,7 @@ namespace V2SubAuto.Views
                 var sbPath = _settingsService.ResolvePath(_settings.SingboxExecutablePath);
 
                 var (xrayOk, sbOk) = await CoreDownloaderService.DownloadLatestCoresAsync(
-                    xrayPath, sbPath, msg => AppendLog($"[{DateTime.Now:HH:mm:ss}] {msg}"), CancellationToken.None);
+                    xrayPath, sbPath, msg => AppendLog($"[{DateTime.Now:HH:mm:ss}] {msg}"), CancellationToken.None, _settings.UseSystemProxyForDownloads);
 
                 RefreshCoreStatus();
                 MessageBox.Show(

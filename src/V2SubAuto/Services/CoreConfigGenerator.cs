@@ -265,6 +265,7 @@ namespace V2SubAuto.Services
                     case ProxyProtocol.Vmess:
                     case ProxyProtocol.Vless:
                         if (!Guid.TryParse(n.Password, out _)) return false;
+                        if (n.Protocol == ProxyProtocol.Vless && !IsValidXrayVlessEncryption(n.VlessEncryption)) return false;
                         return IsValidXrayStream(n);
 
                     case ProxyProtocol.Trojan:
@@ -311,6 +312,65 @@ namespace V2SubAuto.Services
                     default:
                         return false;
                 }
+            }
+        }
+
+        /// <summary>
+        /// Validates a VLESS "encryption" value exactly the way Xray-core's infra/conf/vless.go expects it.
+        /// Xray treats every dot-separated token shorter than 20 chars as padding; if no valid key token
+        /// follows (e.g. "mlkem768x25519plus.native.0rtt." or a truncated key) its padding math slices past
+        /// the end of the string and the whole core PANICS ("slice bounds out of range", then
+        /// "fatal error: panic holding locks") instead of returning a normal config error.
+        /// One such node in a batch kills the entire multi-inbound batch, so it must be rejected up front.
+        /// </summary>
+        public static bool IsValidXrayVlessEncryption(string? encryption)
+        {
+            var enc = string.IsNullOrWhiteSpace(encryption) ? "none" : encryption.Trim();
+            if (enc.Equals("none", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var parts = enc.Split('.');
+            if (parts.Length < 4 || parts[0] != "mlkem768x25519plus")
+                return false;
+            if (parts[1] is not ("native" or "xorpub" or "random"))
+                return false;
+            if (parts[2] is not ("0rtt" or "1rtt"))
+                return false;
+
+            int i = 3;
+            // Leading short tokens are padding specs
+            while (i < parts.Length && parts[i].Length < 20) i++;
+            // At least one key token must remain, and every remaining token must be a valid key
+            if (i >= parts.Length) return false;
+            for (; i < parts.Length; i++)
+            {
+                var token = parts[i];
+                if (token.Length < 20) return false;
+                if (!TryDecodeBase64Url(token, out var len) || (len != 32 && len != 1184))
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool TryDecodeBase64Url(string s, out int byteLength)
+        {
+            byteLength = 0;
+            foreach (var c in s)
+            {
+                bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+                if (!ok) return false;
+            }
+            if (s.Length % 4 == 1) return false;
+            var b64 = s.Replace('-', '+').Replace('_', '/');
+            b64 = b64.PadRight(b64.Length + (4 - b64.Length % 4) % 4, '=');
+            try
+            {
+                byteLength = Convert.FromBase64String(b64).Length;
+                return true;
+            }
+            catch (FormatException)
+            {
+                return false;
             }
         }
 
@@ -682,7 +742,12 @@ namespace V2SubAuto.Services
                     if (!Guid.TryParse(n.Password, out _))
                         return null;
 
-                    var encryption = string.IsNullOrWhiteSpace(n.VlessEncryption) ? "none" : n.VlessEncryption.Trim();
+                    // Malformed post-quantum encryption strings make Xray panic and take the whole batch down
+                    if (!IsValidXrayVlessEncryption(n.VlessEncryption))
+                        return null;
+                    var encryption = string.IsNullOrWhiteSpace(n.VlessEncryption) || n.VlessEncryption.Trim().Equals("none", StringComparison.OrdinalIgnoreCase)
+                        ? "none"
+                        : n.VlessEncryption.Trim();
                     bool hasTransportSecurity = string.Equals(n.StreamSecurity, "tls", StringComparison.OrdinalIgnoreCase)
                         || string.Equals(n.StreamSecurity, "reality", StringComparison.OrdinalIgnoreCase);
 

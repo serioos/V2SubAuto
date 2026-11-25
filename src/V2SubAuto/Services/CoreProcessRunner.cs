@@ -119,6 +119,7 @@ namespace V2SubAuto.Services
 
                 var outputLock = new object();
                 string? fatalLine = null;
+                string? panicLine = null;
                 string? lastNonWarningLine = null;
                 var stdoutDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 var stderrDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -135,6 +136,14 @@ namespace V2SubAuto.Services
                     lock (outputLock)
                     {
                         lastNonWarningLine = trimmed;
+
+                        // Go runtime crashes print the real cause ("panic: ...") first, followed by a generic
+                        // "fatal error: panic holding locks" and goroutine stack lines. Keep the first panic line
+                        // so the useful message isn't overwritten by the generic ones that follow it.
+                        if (panicLine == null && trimmed.StartsWith("panic:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            panicLine = trimmed;
+                        }
                         if (trimmed.Contains("Failed to start", StringComparison.OrdinalIgnoreCase) ||
                             trimmed.Contains("infra/conf", StringComparison.OrdinalIgnoreCase) ||
                             trimmed.Contains("FATAL", StringComparison.OrdinalIgnoreCase))
@@ -184,7 +193,7 @@ namespace V2SubAuto.Services
 
                     if (proc.HasExited)
                     {
-                        var err = await CaptureExitErrorAsync(proc, stdoutDone.Task, stderrDone.Task, outputLock, () => fatalLine, () => lastNonWarningLine).ConfigureAwait(false);
+                        var err = await CaptureExitErrorAsync(proc, stdoutDone.Task, stderrDone.Task, outputLock, () => panicLine ?? fatalLine, () => lastNonWarningLine).ConfigureAwait(false);
                         proc.Dispose();
                         TryDelete(configPath);
                         PortAllocator.ReleasePorts(leasedPorts);
@@ -216,7 +225,7 @@ namespace V2SubAuto.Services
 
                 if (proc.HasExited)
                 {
-                    var err = await CaptureExitErrorAsync(proc, stdoutDone.Task, stderrDone.Task, outputLock, () => fatalLine, () => lastNonWarningLine).ConfigureAwait(false);
+                    var err = await CaptureExitErrorAsync(proc, stdoutDone.Task, stderrDone.Task, outputLock, () => panicLine ?? fatalLine, () => lastNonWarningLine).ConfigureAwait(false);
                     proc.Dispose();
                     TryDelete(configPath);
                     PortAllocator.ReleasePorts(leasedPorts);
@@ -226,7 +235,7 @@ namespace V2SubAuto.Services
                 if ((!firstReady || !lastReady) && probePort > 0)
                 {
                     KillAndWait(proc);
-                    var err = await CaptureExitErrorAsync(proc, stdoutDone.Task, stderrDone.Task, outputLock, () => fatalLine, () => lastNonWarningLine).ConfigureAwait(false);
+                    var err = await CaptureExitErrorAsync(proc, stdoutDone.Task, stderrDone.Task, outputLock, () => panicLine ?? fatalLine, () => lastNonWarningLine).ConfigureAwait(false);
                     proc.Dispose();
                     TryDelete(configPath);
                     PortAllocator.ReleasePorts(leasedPorts);

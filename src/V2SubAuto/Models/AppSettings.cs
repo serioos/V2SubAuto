@@ -85,6 +85,10 @@ namespace V2SubAuto.Models
         // Schedule
         public int RefreshIntervalMinutes { get; set; } = 60;
 
+        // Network: fetch subscription URLs (and core downloads) through the system proxy / active VPN
+        // in case the URLs are filtered. When false, downloads connect directly and ignore any system proxy.
+        public bool UseSystemProxyForDownloads { get; set; } = false;
+
         // Subscriptions
         public List<SubscriptionSource> Subscriptions { get; set; } = new()
         {
@@ -140,6 +144,7 @@ namespace V2SubAuto.Models
             RunImmediatelyOnStartup = RunImmediatelyOnStartup,
             AutoScheduleEnabled = AutoScheduleEnabled,
             RefreshIntervalMinutes = RefreshIntervalMinutes,
+            UseSystemProxyForDownloads = UseSystemProxyForDownloads,
             Subscriptions = (Subscriptions ?? new List<SubscriptionSource>()).Select(s => s.Clone()).ToList(),
             EnableDeduplication = EnableDeduplication,
             EnableTcpingTest = EnableTcpingTest,

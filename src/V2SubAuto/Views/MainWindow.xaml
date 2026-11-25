@@ -312,6 +312,7 @@
 
                                     <TextBlock Text="V2RayN Testing &amp; Filtering" FontSize="15" FontWeight="Bold" Margin="0,16,0,8"/>
                                     <CheckBox x:Name="ChkKeepOlderDedup" Content="Keep older config when removing duplicates (KeepOlderDedupl)"/>
+                                    <CheckBox x:Name="ChkUseSystemProxy" Content="Fetch configs &amp; core downloads through system proxy / VPN" ToolTip="Enable this if your subscription URLs are filtered. Downloads go through the Windows system proxy currently in use (a full-tunnel VPN is used automatically either way). When disabled, downloads connect directly and ignore any system proxy. Speed tests are never affected."/>
                                     <CheckBox x:Name="ChkAllowInsecure" Content="Allow insecure TLS &amp; unencrypted VLESS/Trojan connections" ToolTip="When enabled, unencrypted VLESS/Trojan nodes and insecure TLS certificates are tested (via sing-box or local loopback relay) and included. When disabled, unencrypted VLESS/Trojan nodes are skipped before testing."/>
 
                                     <Grid Margin="0,8,0,0">

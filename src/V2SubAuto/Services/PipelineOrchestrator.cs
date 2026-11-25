@@ -247,7 +247,7 @@ namespace V2SubAuto.Services
                 });
 
                 // 1. Fetch & parse all enabled subscription URLs (compressed, concurrency-limited, with retries)
-                var fetched = await FetchAllSubscriptionsAsync(subsSnapshot, ct).ConfigureAwait(false);
+                var fetched = await FetchAllSubscriptionsAsync(subsSnapshot, s.UseSystemProxyForDownloads, ct).ConfigureAwait(false);
                 UpdateSnapshot(prev => prev with { FetchedCount = fetched.Count });
                 Log($"Fetched {fetched.Count} configs from {subsSnapshot.Count(x => x.Enabled && !string.IsNullOrWhiteSpace(x.Url))} active URL(s).");
 
@@ -452,7 +452,7 @@ namespace V2SubAuto.Services
             }
         }
 
-        private async Task<List<ProxyNode>> FetchAllSubscriptionsAsync(List<SubscriptionSource> subscriptions, CancellationToken ct)
+        private async Task<List<ProxyNode>> FetchAllSubscriptionsAsync(List<SubscriptionSource> subscriptions, bool useSystemProxy, CancellationToken ct)
         {
             var enabled = subscriptions
                 .Where(sub => sub.Enabled && !string.IsNullOrWhiteSpace(sub.Url))
@@ -473,6 +473,8 @@ namespace V2SubAuto.Services
                 MaxConnectionsPerServer = 8,
                 PooledConnectionLifetime = TimeSpan.FromMinutes(2)
             };
+            DownloadProxyHelper.Configure(handler, useSystemProxy);
+            Log($"Subscription route: {DownloadProxyHelper.Describe(useSystemProxy, enabled[0].Url.Trim())}.");
 
             using var http = new HttpClient(handler)
             {
