@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>V2SubAuto</AssemblyName>
+    <RootNamespace>V2SubAuto</RootNamespace>
+    <Version>1.0.0</Version>
+    <Authors>V2SubAuto</Authors>
+    <Description>Lightweight Windows 11 tray automation app replicating V2RayN's subscription, deduplication, Tcping, Real Delay, and Speedtest pipeline.</Description>
+    <PublishSingleFile>false</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+
+</Project>
