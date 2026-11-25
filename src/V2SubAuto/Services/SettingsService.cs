@@ -17,6 +17,8 @@ namespace V2SubAuto.Services
             TypeInfoResolver = new DefaultJsonTypeInfoResolver()
         };
 
+        private readonly object _saveLock = new();
+
         public string BaseDirectory { get; }
         public string DataDirectory { get; }
         public string SettingsPath { get; }
@@ -68,9 +70,12 @@ namespace V2SubAuto.Services
 
         public void Save(AppSettings settings)
         {
-            Directory.CreateDirectory(DataDirectory);
-            var json = JsonSerializer.Serialize(settings, JsonOptions);
-            WriteTextAtomic(SettingsPath, json);
+            lock (_saveLock)
+            {
+                Directory.CreateDirectory(DataDirectory);
+                var json = JsonSerializer.Serialize(settings, JsonOptions);
+                WriteTextAtomic(SettingsPath, json);
+            }
         }
 
         public string ResolvePath(string configuredPath)
@@ -87,9 +92,12 @@ namespace V2SubAuto.Services
         {
             try
             {
-                Directory.CreateDirectory(DataDirectory);
-                WriteTextAtomic(LastSubRawPath, rawContent);
-                WriteTextAtomic(LastSubBase64Path, base64Content);
+                lock (_saveLock)
+                {
+                    Directory.CreateDirectory(DataDirectory);
+                    WriteTextAtomic(LastSubRawPath, rawContent);
+                    WriteTextAtomic(LastSubBase64Path, base64Content);
+                }
             }
             catch
             {

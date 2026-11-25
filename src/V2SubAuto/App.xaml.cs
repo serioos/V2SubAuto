@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Threading;
 using V2SubAuto.Models;
 using V2SubAuto.Services;
 using V2SubAuto.Views;
@@ -36,6 +37,8 @@ namespace V2SubAuto
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
+
+            DispatcherUnhandledException += OnDispatcherUnhandledException;
 
             _singleInstanceMutex = new Mutex(true, "V2SubAuto_SingleInstance_Mutex_v1", out bool createdNew);
             if (!createdNew)
@@ -125,6 +128,20 @@ namespace V2SubAuto
             {
                 _ = Task.Run(() => _orchestrator.RunPipelineAsync());
             }
+        }
+
+        private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
+        {
+            if (_isExiting)
+                return;
+
+            try
+            {
+                _mainWindow?.LogWarning($"Unexpected UI error: {e.Exception.Message}");
+            }
+            catch { }
+
+            e.Handled = true;
         }
 
         private void SetupTrayIcon()

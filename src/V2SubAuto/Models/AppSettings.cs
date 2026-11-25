@@ -1,13 +1,61 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
 
 namespace V2SubAuto.Models
 {
-    public sealed class SubscriptionSource
+    public sealed class SubscriptionSource : INotifyPropertyChanged
     {
-        public string Name { get; set; } = "Default Subscription";
-        public string Url { get; set; } = string.Empty;
-        public bool Enabled { get; set; } = true;
+        private string _name = "Default Subscription";
+        private string _url = string.Empty;
+        private bool _enabled = true;
+
+        public string Name
+        {
+            get => _name;
+            set
+            {
+                var next = value ?? string.Empty;
+                if (_name != next)
+                {
+                    _name = next;
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public string Url
+        {
+            get => _url;
+            set
+            {
+                var next = value ?? string.Empty;
+                if (_url != next)
+                {
+                    _url = next;
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public bool Enabled
+        {
+            get => _enabled;
+            set
+            {
+                if (_enabled != value)
+                {
+                    _enabled = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
+            => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 
     public enum SortOrderMode

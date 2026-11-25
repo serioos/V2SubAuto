@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Threading;
@@ -157,7 +158,7 @@ namespace V2SubAuto.Services
                     NextScheduledUtc = prev.NextScheduledUtc
                 });
 
-                // 1. Fetch & parse all enabled subscription URLs in parallel
+                // 1. Fetch & parse all enabled subscription URLs (compressed, concurrency-limited, with retries)
                 var fetched = await FetchAllSubscriptionsAsync(subsSnapshot, ct).ConfigureAwait(false);
                 UpdateSnapshot(prev => prev with { FetchedCount = fetched.Count });
                 Log($"Fetched {fetched.Count} configs from {subsSnapshot.Count(x => x.Enabled && !string.IsNullOrWhiteSpace(x.Url))} active URL(s).");
@@ -369,27 +370,89 @@ namespace V2SubAuto.Services
             if (enabled.Count == 0)
                 return new List<ProxyNode>();
 
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+            const int MaxConcurrentDownloads = 4;
+            const int MaxAttempts = 2;
+            var perAttemptTimeout = TimeSpan.FromSeconds(90);
+
+            using var handler = new SocketsHttpHandler
+            {
+                AutomaticDecompression = DecompressionMethods.All,
+                ConnectTimeout = TimeSpan.FromSeconds(15),
+                EnableMultipleHttp2Connections = true,
+                MaxConnectionsPerServer = 8,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2)
+            };
+
+            using var http = new HttpClient(handler)
+            {
+                Timeout = Timeout.InfiniteTimeSpan
+            };
             http.DefaultRequestHeaders.UserAgent.ParseAdd("v2rayN/7.0");
+
+            using var downloadGate = new SemaphoreSlim(MaxConcurrentDownloads, MaxConcurrentDownloads);
 
             var fetchTasks = enabled.Select(async sub =>
             {
+                await downloadGate.WaitAsync(ct).ConfigureAwait(false);
                 try
                 {
-                    Log($"Downloading subscription: {sub.Name} ({sub.Url})");
-                    var text = await http.GetStringAsync(sub.Url.Trim(), ct).ConfigureAwait(false);
-                    var parsed = NodeParser.ParseSubscriptionContent(text, sub.Name);
-                    Log($"Parsed {parsed.Count} configs from {sub.Name}.");
-                    return parsed;
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    Log($"Failed to fetch {sub.Name}: {ex.Message}");
+                    var url = sub.Url.Trim();
+                    for (int attempt = 1; attempt <= MaxAttempts; attempt++)
+                    {
+                        try
+                        {
+                            if (attempt == 1)
+                                Log($"Downloading subscription: {sub.Name} ({url})");
+                            else
+                                Log($"Retrying subscription ({attempt}/{MaxAttempts}): {sub.Name}");
+
+                            using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                            attemptCts.CancelAfter(perAttemptTimeout);
+
+                            using var response = await http.GetAsync(
+                                url,
+                                HttpCompletionOption.ResponseHeadersRead,
+                                attemptCts.Token).ConfigureAwait(false);
+                            response.EnsureSuccessStatusCode();
+
+                            var text = await response.Content.ReadAsStringAsync(attemptCts.Token).ConfigureAwait(false);
+                            var parsed = NodeParser.ParseSubscriptionContent(text, sub.Name);
+                            Log($"Parsed {parsed.Count} configs from {sub.Name}.");
+                            return parsed;
+                        }
+                        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                        {
+                            throw;
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            if (attempt < MaxAttempts)
+                            {
+                                Log($"Timed out fetching {sub.Name} after {(int)perAttemptTimeout.TotalSeconds}s — retrying...");
+                                await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                                continue;
+                            }
+
+                            Log($"Failed to fetch {sub.Name}: Timed out after {(int)perAttemptTimeout.TotalSeconds}s ({MaxAttempts} attempts).");
+                            return new List<ProxyNode>();
+                        }
+                        catch (HttpRequestException ex) when (IsTransientHttpError(ex) && attempt < MaxAttempts)
+                        {
+                            Log($"Transient error fetching {sub.Name} ({ex.Message}) — retrying...");
+                            await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Failed to fetch {sub.Name}: {ex.Message}");
+                            return new List<ProxyNode>();
+                        }
+                    }
+
                     return new List<ProxyNode>();
+                }
+                finally
+                {
+                    downloadGate.Release();
                 }
             }).ToArray();
 
@@ -401,6 +464,15 @@ namespace V2SubAuto.Services
             }
 
             return allNodes;
+        }
+
+        private static bool IsTransientHttpError(HttpRequestException ex)
+        {
+            if (ex.StatusCode is null)
+                return true;
+
+            int code = (int)ex.StatusCode.Value;
+            return code == 408 || code == 429 || code >= 500;
         }
 
         private void PublishResults(List<ProxyNode> surviving, AppSettings settings)

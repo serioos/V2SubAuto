@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using V2SubAuto.Models;
@@ -39,6 +40,7 @@ namespace V2SubAuto.Views
         private const int MaxLogLines = 800;
 
         private bool _allowClose;
+        private bool _isCommittingSubEdit;
 
         private static SolidColorBrush CreateFrozenBrush(byte r, byte g, byte b)
         {
@@ -245,29 +247,75 @@ namespace V2SubAuto.Views
             TxtLogs.ScrollToEnd();
         }
 
+        /// <summary>
+        /// Safely finishes any active DataGrid edit transaction without re-entering RowEditEnding
+        /// or throwing InvalidOperationException when switching tabs, sorting, or deleting rows.
+        /// </summary>
+        private bool CommitPendingSubsGridEdits()
+        {
+            if (_isCommittingSubEdit)
+                return false;
+
+            if (SubsGrid.Items is not IEditableCollectionView editableView ||
+                (!editableView.IsEditingItem && !editableView.IsAddingNew))
+            {
+                return false;
+            }
+
+            _isCommittingSubEdit = true;
+            try
+            {
+                try
+                {
+                    SubsGrid.CommitEdit(DataGridEditingUnit.Cell, true);
+                    SubsGrid.CommitEdit(DataGridEditingUnit.Row, true);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Fallback: ensure the EditItem transaction is closed so WPF never throws on DeferRefresh/Remove/Sort
+                    try { SubsGrid.CancelEdit(DataGridEditingUnit.Row); } catch { }
+                }
+                return true;
+            }
+            finally
+            {
+                _isCommittingSubEdit = false;
+            }
+        }
+
+        private void SaveSubscriptionsToSettings(bool logChange = true)
+        {
+            try
+            {
+                _settings.Subscriptions = _subscriptions
+                    .Where(x => !string.IsNullOrWhiteSpace(x.Url))
+                    .Select(x => new SubscriptionSource
+                    {
+                        Name = (x.Name ?? string.Empty).Trim(),
+                        Url = x.Url.Trim(),
+                        Enabled = x.Enabled
+                    })
+                    .ToList();
+
+                _settingsService.Save(_settings);
+                _orchestrator.UpdateSettings(_settings);
+
+                if (logChange)
+                {
+                    int enabledCount = _settings.Subscriptions.Count(x => x.Enabled);
+                    AppendLog($"[{DateTime.Now:HH:mm:ss}] Subscriptions synced ({enabledCount}/{_settings.Subscriptions.Count} enabled).");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogWarning($"Could not save subscriptions: {ex.Message}");
+            }
+        }
+
         private void SyncAndSaveSubscriptions(bool logChange = true)
         {
-            SubsGrid.CommitEdit(DataGridEditingUnit.Cell, true);
-            SubsGrid.CommitEdit(DataGridEditingUnit.Row, true);
-
-            _settings.Subscriptions = _subscriptions
-                .Where(x => !string.IsNullOrWhiteSpace(x.Url))
-                .Select(x => new SubscriptionSource
-                {
-                    Name = (x.Name ?? string.Empty).Trim(),
-                    Url = x.Url.Trim(),
-                    Enabled = x.Enabled
-                })
-                .ToList();
-
-            _settingsService.Save(_settings);
-            _orchestrator.UpdateSettings(_settings);
-
-            if (logChange)
-            {
-                int enabledCount = _settings.Subscriptions.Count(x => x.Enabled);
-                AppendLog($"[{DateTime.Now:HH:mm:ss}] Subscriptions synced ({enabledCount}/{_settings.Subscriptions.Count} enabled).");
-            }
+            CommitPendingSubsGridEdits();
+            SaveSubscriptionsToSettings(logChange);
         }
 
         private void BtnRunNow_Click(object sender, RoutedEventArgs e)
@@ -316,6 +364,8 @@ namespace V2SubAuto.Views
                 return;
             }
 
+            CommitPendingSubsGridEdits();
+
             var name = string.IsNullOrWhiteSpace(TxtNewSubName.Text)
                 ? $"Subscription {_subscriptions.Count + 1}"
                 : TxtNewSubName.Text.Trim();
@@ -324,11 +374,13 @@ namespace V2SubAuto.Views
             TxtNewSubName.Clear();
             TxtNewSubUrl.Clear();
 
-            SyncAndSaveSubscriptions();
+            SaveSubscriptionsToSettings();
         }
 
         private void BtnDeleteSub_Click(object sender, RoutedEventArgs e)
         {
+            CommitPendingSubsGridEdits();
+
             var selectedItems = SubsGrid.SelectedItems.OfType<SubscriptionSource>().ToList();
             if (selectedItems.Count == 0)
                 return;
@@ -338,20 +390,57 @@ namespace V2SubAuto.Views
                 _subscriptions.Remove(item);
             }
 
-            SyncAndSaveSubscriptions();
+            SaveSubscriptionsToSettings();
         }
 
         private void SubEnabledCheckBox_Click(object sender, RoutedEventArgs e)
         {
-            // Defer slightly so the TwoWay CheckBox binding updates the item before syncing
-            Dispatcher.BeginInvoke(() => SyncAndSaveSubscriptions());
+            // Defer so the TwoWay CheckBox binding updates the item before saving
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, () => SaveSubscriptionsToSettings());
+        }
+
+        private void SubsGrid_CellEditEnding(object? sender, DataGridCellEditEndingEventArgs e)
+        {
+            if (_isCommittingSubEdit || e.EditAction != DataGridEditAction.Commit)
+                return;
+
+            // Persist the edit after WPF completes cell commit; do not call CommitEdit here
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, () => SaveSubscriptionsToSettings(logChange: false));
         }
 
         private void SubsGrid_RowEditEnding(object? sender, DataGridRowEditEndingEventArgs e)
         {
-            if (e.EditAction == DataGridEditAction.Commit)
+            if (_isCommittingSubEdit || e.EditAction != DataGridEditAction.Commit)
+                return;
+
+            // Persist the edit after WPF completes row commit; do not re-enter CommitEdit here
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, () => SaveSubscriptionsToSettings());
+        }
+
+        private void SubsGrid_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+        {
+            if (_isCommittingSubEdit || SubsGrid.IsKeyboardFocusWithin)
+                return;
+
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
             {
-                Dispatcher.BeginInvoke(() => SyncAndSaveSubscriptions());
+                if (!SubsGrid.IsKeyboardFocusWithin && CommitPendingSubsGridEdits())
+                {
+                    SaveSubscriptionsToSettings();
+                }
+            });
+        }
+
+        private void SubsGrid_Sorting(object sender, DataGridSortingEventArgs e)
+        {
+            CommitPendingSubsGridEdits();
+        }
+
+        private void SubsGrid_Unloaded(object sender, RoutedEventArgs e)
+        {
+            if (CommitPendingSubsGridEdits())
+            {
+                SaveSubscriptionsToSettings(logChange: false);
             }
         }
 
@@ -408,8 +497,7 @@ namespace V2SubAuto.Views
                 }
 
                 // Commit any pending subscription edits so Save Settings never overwrites them with stale data
-                SubsGrid.CommitEdit(DataGridEditingUnit.Cell, true);
-                SubsGrid.CommitEdit(DataGridEditingUnit.Row, true);
+                CommitPendingSubsGridEdits();
                 _settings.Subscriptions = _subscriptions
                     .Where(x => !string.IsNullOrWhiteSpace(x.Url))
                     .Select(x => new SubscriptionSource

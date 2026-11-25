@@ -212,7 +212,11 @@
                                   BorderBrush="{StaticResource BorderSubtle}"
                                   BorderThickness="1"
                                   HorizontalGridLinesBrush="#283044"
-                                  RowEditEnding="SubsGrid_RowEditEnding">
+                                  CellEditEnding="SubsGrid_CellEditEnding"
+                                  RowEditEnding="SubsGrid_RowEditEnding"
+                                  Sorting="SubsGrid_Sorting"
+                                  LostKeyboardFocus="SubsGrid_LostKeyboardFocus"
+                                  Unloaded="SubsGrid_Unloaded">
                             <DataGrid.ColumnHeaderStyle>
                                 <Style TargetType="DataGridColumnHeader">
                                     <Setter Property="Background" Value="#141821"/>
